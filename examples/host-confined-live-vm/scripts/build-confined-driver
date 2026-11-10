@@ -1,0 +1,100 @@
+#!/usr/bin/python3
+"""Build the pinned 0.1.7 driver with a mandatory per-VM host launcher.
+
+Reuses the exact compressed guest/runtime artifacts embedded in NVIDIA's
+checksum-verified vendor driver; no guest kernel or supervisor is rebuilt.
+Build output and binaries stay outside OneDrive. Deployment is explicit.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tarfile
+
+MODULE=Path(__file__).resolve().parents[1]
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def prepare(source_archive, vendor_driver, work):
+    spec=json.loads((MODULE/'runtime/v0.1.7-resources.json').read_text())
+    archive=source_archive.read_bytes(); vendor=vendor_driver.read_bytes()
+    if digest(archive)!=spec['source_sha256'] or digest(vendor)!=spec['vendor_driver_sha256']:
+        raise ValueError('source archive or vendor driver digest differs from the reviewed 0.1.7 inputs')
+    work.mkdir(mode=0o700,parents=True,exist_ok=False)
+    resources=work/'runtime-compressed'; resources.mkdir(mode=0o700)
+    for entry in spec['resources']:
+        start=entry['offset']; frame=vendor[start:start+entry['compressed_size']]
+        raw=subprocess.run(['zstd','-q','-d','-c'],input=frame,check=True,capture_output=True).stdout
+        if len(raw)!=entry['size'] or digest(raw)!=entry['sha256']:
+            raise ValueError('embedded resource verification failed: '+entry['name'])
+        (resources/(entry['name']+'.zst')).write_bytes(frame)
+    with tarfile.open(source_archive) as archive_file:
+        archive_file.extractall(work,filter='data')
+    source=work/'OpenShell-0.1.7'
+    # Release automation stamps this workspace version too; no external locked
+    # dependency version or checksum is changed.
+    manifest=source/'Cargo.toml'; text=manifest.read_text()
+    assert text.count('version = "0.0.0"')==1
+    manifest.write_text(text.replace('version = "0.0.0"','version = "0.1.7"'))
+    lock=source/'Cargo.lock'
+    lock.write_text(re.sub(r'(name = "openshell[^"\n]*"\nversion = )"0\.0\.0"',r'\g<1>"0.1.7"',lock.read_text()))
+    patch=MODULE/'runtime/require-host-launcher.patch'
+    subprocess.run(['git-agent','apply','--check',str(patch)],cwd=source,check=True)
+    subprocess.run(['git-agent','apply',str(patch)],cwd=source,check=True)
+    return source,resources
+
+
+def install_driver(binary, provenance, vendor):
+    dest=Path.home()/'.local/libexec/openshell/v0.1.7-confined'
+    dest.mkdir(parents=True,exist_ok=True)
+    staged=dest/'openshell-driver-vm.new'; shutil.copy2(binary,staged)
+    staged.chmod(0o755); staged.replace(dest/'openshell-driver-vm')
+    staged=dest/'provenance.json.new'; shutil.copy2(provenance,staged)
+    staged.chmod(0o600); staged.replace(dest/'provenance.json')
+    for name in ['openshell-supervisor','openshell-prover']:
+        target=dest/name
+        if not target.exists(): target.symlink_to(vendor/name)
+    return dest
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--source-archive',type=Path,required=True)
+    p.add_argument('--vendor-driver',type=Path,default=Path.home()/'.local/libexec/openshell/v0.1.7/openshell-driver-vm')
+    p.add_argument('--workdir',type=Path,required=True,help='new private output directory outside OneDrive')
+    p.add_argument('--prepare-only',action='store_true')
+    p.add_argument('--install',action='store_true',help='install only the versioned confined driver; do not change gateway config')
+    a=p.parse_args(); work=a.workdir.expanduser().resolve()
+    # Explicitly constrain generated state to the local, nonsynchronized tree.
+    state=(Path.home()/'.local/state').resolve()
+    if work==state or not work.is_relative_to(state):
+        raise ValueError('build directory must be beneath ~/.local/state')
+    os.umask(0o077)
+    source,resources=prepare(a.source_archive.resolve(),a.vendor_driver.resolve(),work)
+    if a.prepare_only: return
+    env=os.environ.copy()
+    env.update(CARGO_BUILD_JOBS='4',CARGO_PROFILE_DEV_DEBUG='0',CARGO_TARGET_DIR=str(work/'target'),OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=str(resources))
+    # Vega's user-local Zig toolchain substitutes for a layered host C compiler.
+    if not shutil.which('cc') and shutil.which('zig'):
+        compiler=work/'zig-cc'
+        compiler.write_text('#!/usr/bin/python3\nimport os,sys\nargs=[x for x in sys.argv[1:] if x!="--target=x86_64-unknown-linux-gnu"]\nos.execv('+repr(shutil.which('zig'))+',["zig","cc",*args])\n')
+        compiler.chmod(0o700)
+        env.update(CC=str(compiler),CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=str(compiler))
+        if shutil.which('llvm-ar'): env['AR']=shutil.which('llvm-ar')
+    subprocess.run(['cargo','build','--locked','--target','x86_64-unknown-linux-gnu','-p','openshell-driver-vm','--bin','openshell-driver-vm'],cwd=source,env=env,check=True)
+    binary=work/'target/x86_64-unknown-linux-gnu/debug/openshell-driver-vm'
+    (work/'provenance.json').write_text(json.dumps({'version':'0.1.7','driver_sha256':digest(binary.read_bytes()),'patch_sha256':digest((MODULE/'runtime/require-host-launcher.patch').read_bytes()),'resources_manifest_sha256':digest((MODULE/'runtime/v0.1.7-resources.json').read_bytes())},indent=2)+'\n')
+    if a.install:
+        dest=install_driver(binary,work/'provenance.json',a.vendor_driver.resolve().parent)
+        print(f'Installed {dest}; gateway configuration is unchanged.')
+
+
+if __name__=='__main__':
+    main()

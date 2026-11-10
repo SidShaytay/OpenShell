@@ -1,0 +1,21 @@
+{
+  "source": "SidShaytay/home-config:hosts/vega/openshell",
+  "source_commits": [
+    "13aa47b",
+    "bf9f5ad"
+  ],
+  "upstream_base": "v0.1.7",
+  "files_sha256": {
+    "scripts/openshell-vm-worker": "5c8a8417e0637c901ffce988df9ea2bb4fad5a37efe1a011dc2b377cd77854d0",
+    "scripts/openshell-vm-reaper": "72f046a7965c0dc2d951406d1dd0d39f2684f5064416114713f9afc1445d1eed",
+    "scripts/build-confined-driver": "606f99b164a2c0d2ef69a39d3b267ff0ec2c0f89f8b6a078cb44e03b8609ae94",
+    "scripts/openshell-project": "bc923df577f8fe379fc8b1e3d5c6238dce9ea7fd811c920bd6d816d1f5233f38",
+    "tests/test_vm_worker.py": "6d65f1364df61e8eefba9baf0c86b31897ee972d7277cbba940c55d40aadeb87",
+    "tests/test_workflow.py": "98643c7f3855768c59bd8ca28f34e10c7831b1f2943c56f85182587c87a0088d",
+    "runtime/require-host-launcher.patch": "64450cfdceaf6bacdedee8b312e1e38226a656ed16f4264c17c4883de7da7c4f",
+    "runtime/v0.1.7-resources.json": "d7f01225515d41da4fd8d480d2dd34a5fa5193311062fc5c294bd97c2afeecc2",
+    "policies/coding-agent.yaml": "21ad151510b64471f4e4970531ab045c00d630a2a87d73cba4db8217b891b74f",
+    "config/gateways/vm.toml": "ab1785fafd88993c94380e3b1281fdb4a4f7cb1cce97c40e7479431482b393d7",
+    "config/systemd/openshell-v0.1.2-vm.service": "a916383d7ddeb260361f0ae3add0bf566c647cb75f88aaaf3103bc49369e139e"
+  }
+}

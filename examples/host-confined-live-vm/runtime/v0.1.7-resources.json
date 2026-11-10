@@ -1,0 +1,49 @@
+{
+  "version": "0.1.7",
+  "source_sha256": "0f41d081acffffd3deed8111001dc660186f8b6e72beeffd3fbe7da496845c0e",
+  "vendor_driver_sha256": "ca62c9f9beb14fd21596181ff7edf7401360dadb2eae71bad5d0489239bd7087",
+  "resources": [
+    {
+      "name": "umoci",
+      "offset": 3820489,
+      "compressed_size": 2609518,
+      "size": 7946424,
+      "sha256": "b51c267ec394499e42c6fde47f240b7b7dba57ea49df0b5acd304378b82a3b71"
+    },
+    {
+      "name": "openshell-vm-init",
+      "offset": 6430053,
+      "compressed_size": 202378,
+      "size": 447848,
+      "sha256": "23dd59ac7245d44b2d3f6f12608088751f3bd0edcf154136b88065d6a5dd30e6"
+    },
+    {
+      "name": "openshell-supervisor",
+      "offset": 6661255,
+      "compressed_size": 12696126,
+      "size": 50288776,
+      "sha256": "396b3501de1b3d2865eaf360f85c12f7c79a58e01583b4c05dffc3bf40875ee5"
+    },
+    {
+      "name": "openshell-sandbox",
+      "offset": 19357381,
+      "compressed_size": 3541965,
+      "size": 11673328,
+      "sha256": "d13966b032b07d75c917d3fbb7471e608edfdf1f25e9d922e5aa7c779cf6ad21"
+    },
+    {
+      "name": "libkrun.so",
+      "offset": 22899932,
+      "compressed_size": 2077127,
+      "size": 6899592,
+      "sha256": "71c5aab36c55955747c9ad5a8c70f34e2210675ef59f371dfb570fd95c246780"
+    },
+    {
+      "name": "libkrunfw.so.5",
+      "offset": 24977059,
+      "compressed_size": 7525417,
+      "size": 21759672,
+      "sha256": "04a624ea1ff401da934264661138776f4f640643033bf5474a77212b1a643fd0"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenShell 0.1.7 host-confined MicroVM gateway
+
+[Service]
+Type=simple
+Environment="OPENSHELL_VM_HOST_LAUNCHER=/var/home/sid/.local/bin/openshell-vm-worker"
+Environment="PATH=/var/home/sid/.local/libexec/openshell-tools/e2fsprogs-1.47.4/sbin:/usr/bin:/bin"
+Environment="MKE2FS_CONFIG=/var/home/sid/.local/libexec/openshell-tools/e2fsprogs-1.47.4/etc/mke2fs.conf"
+ExecStart=/var/home/sid/.local/bin/openshell-gateway-start vm --name openshell-v0.1.2-vm --bind-address 127.0.0.1 --port 18081 --compute-driver vm --db-url sqlite:/var/home/sid/.local/state/openshell-v0.1.2-vm/gateway.db?mode=rwc
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

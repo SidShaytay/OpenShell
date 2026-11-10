@@ -1,0 +1,41 @@
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "vm"
+guest_tls_ca = "/var/home/sid/.local/state/openshell-v0.1.2-vm/tls/ca.crt"
+
+[openshell.gateway.tls]
+cert_path = "/var/home/sid/.local/state/openshell-v0.1.2-vm/tls/server/tls.crt"
+key_path = "/var/home/sid/.local/state/openshell-v0.1.2-vm/tls/server/tls.key"
+client_ca_path = "/var/home/sid/.local/state/openshell-v0.1.2-vm/tls/ca.crt"
+
+[openshell.gateway.credential_storage]
+key_encryption_key_path = "/var/home/sid/.local/state/openshell/gateway/credentials/key-encryption-key.bin"
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/var/home/sid/.local/state/openshell-v0.1.2-vm/tls/jwt/signing.pem"
+public_key_path = "/var/home/sid/.local/state/openshell-v0.1.2-vm/tls/jwt/public.pem"
+kid_path = "/var/home/sid/.local/state/openshell-v0.1.2-vm/tls/jwt/kid"
+gateway_id = "openshell-v0.1.2-vm"
+
+[openshell.gateway.mtls_auth]
+enabled = true
+
+[openshell.drivers.vm]
+grpc_endpoint = "https://127.0.0.1:18081"
+driver_dir = "/var/home/sid/.local/libexec/openshell/v0.1.7-confined"
+state_dir = "/var/home/sid/.local/state/openshell-v0.1.2-vm/driver"
+default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
+bootstrap_image = "nvcr.io/nvidia/base/ubuntu:24.04"
+vcpus = 4
+mem_mib = 8192
+overlay_disk_mib = 8192
+sandbox_uid = 1000
+sandbox_gid = 1000
+# Live shares are restricted by the mandatory per-worker host namespace launcher.
+allow_driver_config = true
+enable_bind_mounts = true
+
+[openshell.drivers.vm.resource_admission]
+enabled = false

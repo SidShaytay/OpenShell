@@ -1,0 +1,187 @@
+#!/usr/bin/python3
+"""Run OpenShell's actual libkrun worker in a per-project host namespace.
+
+This is an operator-owned launcher, not a guest command. Unknown options fail
+closed. The patched driver requires this launcher for both ordinary and image-
+preparation VMs. Image preparation itself remains outside the VM namespace.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tomllib
+
+HOME = Path.home().resolve()
+ROOT = Path('/mnt/data/projects').resolve()
+DRIVER_STATE = HOME/'.local/state/openshell-v0.1.2-vm/driver'
+VENDOR = HOME/'.local/libexec/openshell/v0.1.7/openshell-driver-vm'
+RUNTIME = HOME/'.local/share/openshell/vm-runtime/0.1.7'
+REAPER = Path(__file__).resolve().with_name('openshell-vm-reaper')
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(message)
+
+
+def checked_path(value, root, directory=False, create=False):
+    p = Path(value)
+    if not p.is_absolute() or any(ord(c)<32 for c in str(p)):
+        raise ValueError(f'expected an absolute path without control characters: {p}')
+    resolved = p.resolve(strict=not create)
+    if resolved != p or resolved == root or not resolved.is_relative_to(root):
+        raise ValueError(f'path is outside its permitted root or uses a symlink: {p}')
+    if directory and not p.is_dir():
+        raise ValueError(f'not a directory: {p}')
+    if not directory:
+        if create:
+            fd = os.open(p, os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC, 0o600)
+            os.close(fd)
+        if not p.is_file():
+            raise ValueError(f'not a regular file: {p}')
+    return p
+
+
+def parse_worker(argv):
+    p = Parser(add_help=False, allow_abbrev=False)
+    p.add_argument('--internal-run-vm', action='store_true', required=True)
+    for name in ['root-disk', 'overlay-disk', 'console-output']:
+        p.add_argument('--vm-'+name, required=True)
+    for name in ['image-disk', 'exec', 'workdir', 'vcpus', 'mem-mib', 'krun-log-level',
+                 'vsock-control-port', 'vsock-control-socket']:
+        p.add_argument('--vm-'+name)
+    p.add_argument('--vm-vsock-runtime-initiated', action='store_true')
+    p.add_argument('--vm-env', action='append', default=[])
+    p.add_argument('--vm-mount', action='append', default=[])
+    a = p.parse_args(argv)
+    if len(a.vm_mount)>1:
+        raise ValueError('the confined worker permits at most one project share')
+    shares=[]
+    for entry in a.vm_mount:
+        parts=entry.split('\t')
+        if len(parts)!=3 or parts[1]!='osfs0' or parts[2] not in ['ro', 'rw']:
+            raise ValueError('invalid VM project mount')
+        source=checked_path(parts[0], ROOT, directory=True)
+        shares.append((source, parts[2]=='ro'))
+    return a, shares
+
+
+def open_project(source):
+    """Pin every directory component beneath ROOT without following symlinks.
+
+    A guest in a parent project must not race validation by replacing an
+    ancestor of a later nested-project share with a host-pointing symlink.
+    """
+    flags=os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC
+    fd=os.open(ROOT,flags)
+    try:
+        for part in source.relative_to(ROOT).parts:
+            child=os.open(part,flags,dir_fd=fd)
+            os.close(fd); fd=child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def sandbox_command(argv, command=None):
+    """Return bubblewrap argv and pinned bind descriptors; caller owns fds.
+
+    The optional command is used by host-side confinement tests. Production
+    always executes the pinned vendor VM worker with the original driver args.
+    """
+    a, shares = parse_worker(argv)
+    root = checked_path(a.vm_root_disk, DRIVER_STATE)
+    overlay = checked_path(a.vm_overlay_disk, DRIVER_STATE)
+    console = checked_path(a.vm_console_output, DRIVER_STATE, create=True)
+    image = checked_path(a.vm_image_disk, DRIVER_STATE) if a.vm_image_disk else None
+    control = None
+    if a.vm_vsock_control_socket:
+        socket=Path(a.vm_vsock_control_socket)
+        expected=rf'/tmp/os-{os.getuid()}-[0-9a-f]+/[A-Za-z0-9._-]+/control\.sock'
+        if not re.fullmatch(expected, str(socket)) or socket.parent.resolve(strict=True)!=socket.parent:
+            raise ValueError('invalid per-VM control socket directory')
+        control=socket.parent
+    if not RUNTIME.is_dir():
+        raise ValueError(f'pinned libkrun runtime is missing: {RUNTIME}')
+    cmd=['/usr/bin/bwrap', '--unshare-all', '--unshare-user', '--disable-userns', '--cap-drop', 'ALL',
+         '--die-with-parent', '--new-session', '--clearenv',
+         '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin',
+         '--symlink', 'usr/lib64', '/lib64', '--symlink', 'usr/lib', '/lib',
+         '--symlink', 'usr/sbin', '/sbin', '--proc', '/proc', '--dev', '/dev',
+         '--tmpfs', '/tmp', '--dir', '/run', '--dir', '/etc',
+         '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'HOME', '/tmp',
+         '--setenv', 'OPENSHELL_VM_RUNTIME_DIR', str(RUNTIME),
+         '--setenv', 'LD_LIBRARY_PATH', str(RUNTIME), '--chdir', '/']
+    fds=[]
+    def bind(source, readonly, project=False):
+        fd=open_project(source) if project else os.open(source, os.O_PATH|os.O_NOFOLLOW|os.O_CLOEXEC)
+        fds.append(fd)
+        if stat.S_ISLNK(os.fstat(fd).st_mode):
+            raise ValueError(f'refusing symlink bind: {source}')
+        cmd.extend(['--ro-bind-fd' if readonly else '--bind-fd', str(fd), str(source)])
+    try:
+        bind(root, True)
+        bind(overlay, False)
+        bind(console, False)
+        if image: bind(image, True)
+        bind(RUNTIME, True)
+        bind(REAPER, True)
+        if command is None: bind(VENDOR, True)
+        for source, readonly in shares: bind(source, readonly, project=True)
+        # The host supervisor creates its socket here after worker launch.
+        # A read-only directory bind permits connecting, not creating sockets.
+        if control: bind(control, True)
+        if Path('/dev/kvm').exists():
+            cmd.extend(['--dev-bind', '/dev/kvm', '/dev/kvm'])
+        elif command is None:
+            raise ValueError('/dev/kvm is unavailable')
+        cmd.extend(['--remount-ro', '/', '--', '/usr/bin/python3', '-I', str(REAPER), *(command or [str(VENDOR), *argv])])
+        return cmd, fds
+    except BaseException:
+        for fd in fds: os.close(fd)
+        raise
+
+
+def check_install():
+    """Refuse a vendor-driver downgrade or incomplete deployment of live mode."""
+    expected=HOME/'.local/libexec/openshell/v0.1.7-confined'
+    config=tomllib.loads((HOME/'.config/openshell/servers/vm/gateway.toml').read_text())['openshell']['drivers']['vm']
+    if config.get('driver_dir')!=str(expected) or not config.get('allow_driver_config') or not config.get('enable_bind_mounts') or config.get('resource_admission',{}).get('enabled') is not False:
+        raise ValueError('VM configuration does not select the confined live-sharing driver')
+    provenance=json.loads((expected/'provenance.json').read_text())
+    if provenance.get('version')!='0.1.7' or hashlib.sha256((expected/'openshell-driver-vm').read_bytes()).hexdigest()!=provenance.get('driver_sha256'):
+        raise ValueError('confined VM driver is missing or differs from its build provenance')
+    unit=(HOME/'.config/systemd/user/openshell-v0.1.2-vm.service').read_text()
+    if f'OPENSHELL_VM_HOST_LAUNCHER={HOME}/.local/bin/openshell-vm-worker' not in unit:
+        raise ValueError('VM service does not configure the mandatory host launcher')
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    check_install()
+    if argv==['--check-install']:
+        print('OpenShell confined live-VM installation verified.')
+        return
+    if len(argv)==2 and argv[0]=='--internal-prepare-image':
+        # This helper resolves/builds disk images, and never runs libkrun itself.
+        # Its serialized operator launcher setting points nested VM launches
+        # back here. No guest-controlled filesystem requests reach this helper.
+        checked_path(argv[1], DRIVER_STATE)
+        os.execv(VENDOR, [str(VENDOR), *argv])
+    cmd, fds = sandbox_command(argv)
+    print('osh: host worker confined to its project, disks and control endpoint', file=sys.stderr, flush=True)
+    for fd in fds: os.set_inheritable(fd, True)
+    os.execv(cmd[0], cmd)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError) as error:
+        print(f'osh VM confinement refused: {error}', file=sys.stderr)
+        sys.exit(1)

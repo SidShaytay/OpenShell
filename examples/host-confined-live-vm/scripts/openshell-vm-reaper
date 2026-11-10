@@ -1,0 +1,21 @@
+#!/usr/bin/python3
+"""Keep the vendor launcher's parent above PID 1 inside its PID namespace.
+
+OpenShell treats parent PID 1 as an orphan. Bubblewrap supplies namespace PID 1;
+this tiny parent lets the vendor retain its own parent-death checks unchanged.
+The namespace still dies with bubblewrap/the compute driver.
+"""
+import signal
+import subprocess
+import sys
+
+child=subprocess.Popen(sys.argv[1:])
+def forward(signum, _frame):
+    try:
+        child.send_signal(signum)
+    except ProcessLookupError:
+        pass
+for sig in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP):
+    signal.signal(sig,forward)
+rc=child.wait()
+sys.exit(rc if rc>=0 else 128-rc)

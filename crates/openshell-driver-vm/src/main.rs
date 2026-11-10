@@ -332,7 +332,12 @@ async fn main() -> Result<()> {
         supervisor_otlp,
         supervisor_gateway_name: args.gateway_name.clone(),
         state_dir: args.state_dir.clone(),
-        launcher_bin: None,
+        // Vega: every VM launch must pass through the host confinement launcher.
+        // This is operator configuration, never a guest/template override.
+        launcher_bin: Some(PathBuf::from(
+            std::env::var_os("OPENSHELL_VM_HOST_LAUNCHER")
+                .ok_or_else(|| miette::miette!("OPENSHELL_VM_HOST_LAUNCHER is required by the confined Vega driver"))?,
+        )),
         default_image: args.default_image.clone(),
         bootstrap_image: args.bootstrap_image.clone(),
         log_level: args.log_level.clone(),
