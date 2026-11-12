@@ -21,6 +21,7 @@ DRIVER_STATE = HOME/'.local/state/openshell-v0.1.2-vm/driver'
 VENDOR = HOME/'.local/libexec/openshell/v0.1.7/openshell-driver-vm'
 RUNTIME = HOME/'.local/share/openshell/vm-runtime/0.1.7'
 REAPER = Path(__file__).resolve().with_name('openshell-vm-reaper')
+TOOLS = HOME/'.local/share/openshell/agent-tools'
 
 
 class Parser(argparse.ArgumentParser):
@@ -58,28 +59,34 @@ def parse_worker(argv):
     p.add_argument('--vm-env', action='append', default=[])
     p.add_argument('--vm-mount', action='append', default=[])
     a = p.parse_args(argv)
-    if len(a.vm_mount)>1:
-        raise ValueError('the confined worker permits at most one project share')
+    if len(a.vm_mount)>2:
+        raise ValueError('the confined worker permits one project share and one read-only tools share')
     shares=[]
-    for entry in a.vm_mount:
+    for index,entry in enumerate(a.vm_mount):
         parts=entry.split('\t')
-        if len(parts)!=3 or parts[1]!='osfs0' or parts[2] not in ['ro', 'rw']:
-            raise ValueError('invalid VM project mount')
-        source=checked_path(parts[0], ROOT, directory=True)
+        if len(parts)!=3 or parts[1]!=f'osfs{index}' or parts[2] not in ['ro', 'rw']:
+            raise ValueError('invalid VM mount')
+        if index==0:
+            source=checked_path(parts[0], ROOT, directory=True)
+        else:
+            if parts[0]!=str(TOOLS) or parts[2]!='ro':
+                raise ValueError('second share must be the exact read-only host tools directory')
+            source=checked_path(parts[0], TOOLS.parent, directory=True)
         shares.append((source, parts[2]=='ro'))
     return a, shares
 
 
-def open_project(source):
+def open_project(source,root=None):
     """Pin every directory component beneath ROOT without following symlinks.
 
     A guest in a parent project must not race validation by replacing an
     ancestor of a later nested-project share with a host-pointing symlink.
     """
+    root=ROOT if root is None else root
     flags=os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC
-    fd=os.open(ROOT,flags)
+    fd=os.open(root,flags)
     try:
-        for part in source.relative_to(ROOT).parts:
+        for part in source.relative_to(root).parts:
             child=os.open(part,flags,dir_fd=fd)
             os.close(fd); fd=child
         return fd
@@ -119,7 +126,7 @@ def sandbox_command(argv, command=None):
          '--setenv', 'LD_LIBRARY_PATH', str(RUNTIME), '--chdir', '/']
     fds=[]
     def bind(source, readonly, project=False):
-        fd=open_project(source) if project else os.open(source, os.O_PATH|os.O_NOFOLLOW|os.O_CLOEXEC)
+        fd=open_project(source,TOOLS.parent if source==TOOLS else ROOT) if project else os.open(source, os.O_PATH|os.O_NOFOLLOW|os.O_CLOEXEC)
         fds.append(fd)
         if stat.S_ISLNK(os.fstat(fd).st_mode):
             raise ValueError(f'refusing symlink bind: {source}')
@@ -156,7 +163,7 @@ def check_install():
     provenance=json.loads((expected/'provenance.json').read_text())
     if provenance.get('version')!='0.1.7' or hashlib.sha256((expected/'openshell-driver-vm').read_bytes()).hexdigest()!=provenance.get('driver_sha256'):
         raise ValueError('confined VM driver is missing or differs from its build provenance')
-    unit=(HOME/'.config/systemd/user/openshell-v0.1.2-vm.service').read_text()
+    unit=(HOME/'.config/systemd/user/openshell-vm.service').read_text()
     if f'OPENSHELL_VM_HOST_LAUNCHER={HOME}/.local/bin/openshell-vm-worker' not in unit:
         raise ValueError('VM service does not configure the mandatory host launcher')
 

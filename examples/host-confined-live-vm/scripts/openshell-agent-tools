@@ -1,0 +1,216 @@
+#!/usr/bin/python3
+"""Publish host-installed agents to the read-only share used by running VMs.
+
+No downloads, credentials, settings or histories. Releases are immutable and
+retained for running processes; only per-tool current symlinks are replaced.
+"""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+
+STORE=Path.home()/'.local/share/openshell/agent-tools'
+PI_PACKAGE='@earendil-works/pi-coding-agent'
+
+
+def host_executable(name):
+    # Interactive PATH may start with host-only auth/session launchers. Resolve
+    # installations in the same order as the background service instead.
+    preferred=[Path.home()/'.local/bin',Path.home()/'.bun/bin',Path('/home/linuxbrew/.linuxbrew/bin')]
+    search=os.pathsep.join([*(str(p) for p in preferred),os.environ.get('PATH','')])
+    found=shutil.which(name,path=search)
+    if not found: raise ValueError(f'Host {name} installation was not found')
+    source=Path(found).resolve(strict=True)
+    if name in ('claude','codex','node'):
+        with source.open('rb') as binary: header=binary.read(4)
+        if header!=b'\x7fELF':
+            raise ValueError(f'Host {name} at {source} is not a native ELF executable; publish the underlying tool installation, not a host launcher script')
+    return source
+
+
+def stamp(path):
+    resolved=path.resolve(strict=True); info=resolved.stat()
+    return [str(resolved),info.st_size,info.st_mtime_ns,info.st_ctime_ns]
+
+
+def package_root(executable):
+    for parent in executable.resolve(strict=True).parents:
+        if (parent/'package.json').is_file(): return parent
+    raise ValueError(f'No package.json above {executable}')
+
+
+def modules_root(package):
+    return next(p for p in reversed(package.parents) if p.name=='node_modules')
+
+
+def package_closure(package):
+    root=modules_root(package).resolve(strict=True)
+    found=set(); pending=[package]
+    while pending:
+        current=pending.pop()
+        if current in found: continue
+        if not current.resolve(strict=True).is_relative_to(root):
+            raise ValueError(f'Package outside installation root: {current}')
+        found.add(current)
+        meta=json.loads((current/'package.json').read_text())
+        required=meta.get('dependencies',{})
+        optional=meta.get('optionalDependencies',{})
+        peers=meta.get('peerDependencies',{})
+        for name in required.keys()|optional.keys()|peers.keys():
+            if not re.fullmatch(r'(?:@[\w.-]+/)?[\w.-]+',name) or name in ('.','..'):
+                raise ValueError(f'Invalid dependency name: {name}')
+            dependency=None
+            for parent in (current,*current.parents):
+                if not parent.is_relative_to(root): break
+                candidate=parent/'node_modules'/name
+                if (candidate/'package.json').is_file(): dependency=candidate; break
+            if dependency is None and (root/name/'package.json').is_file(): dependency=root/name
+            if dependency is None:
+                if name in required and name not in optional: raise ValueError(f'Missing dependency {name} of {current}')
+            else: pending.append(dependency)
+    return sorted(found)
+
+
+def copy_package(source,dest):
+    """Materialize package symlinks only when they stay within this installation."""
+    root=modules_root(source).resolve(strict=True)
+    for current,dirs,files in os.walk(source,followlinks=False):
+        dirs[:]=[name for name in dirs if name not in ('node_modules','.git')]
+        for name in dirs+files:
+            path=Path(current)/name
+            if path.is_symlink():
+                if not path.resolve(strict=True).is_relative_to(root):
+                    raise ValueError(f'Package symlink outside installation: {path}')
+                if path.is_dir(): raise ValueError(f'Package directory symlink is not supported: {path}')
+            elif not (path.is_file() or path.is_dir()):
+                raise ValueError(f'Unsupported special package file: {path}')
+    shutil.copytree(source,dest,symlinks=False,ignore=shutil.ignore_patterns('node_modules','.git','.npmrc','.env'))
+
+
+def library_files(executable):
+    result=subprocess.run(['/usr/bin/ldd',str(executable)],capture_output=True,text=True)
+    if result.returncode:
+        if 'not a dynamic executable' in result.stdout+result.stderr or 'statically linked' in result.stdout+result.stderr: return []
+        raise ValueError(f'Cannot resolve runtime libraries for {executable}: {result.stderr}')
+    if 'not found' in result.stdout: raise ValueError(f'Missing library for {executable}: {result.stdout}')
+    return sorted({Path(value) for value in re.findall(r'(?:=>\s+|^\s*)(/\S+)',result.stdout,re.M)})
+
+
+def verify(command):
+    with tempfile.TemporaryDirectory(prefix='osh-tool-check-') as home:
+        result=subprocess.run([str(x) for x in command],capture_output=True,text=True,timeout=30,
+                              env={'HOME':home,'PATH':'/usr/bin:/bin','DISABLE_AUTOUPDATER':'1','DISABLE_UPDATES':'1','PI_OFFLINE':'1'})
+        if result.returncode: raise ValueError(f'Tool validation failed: {result.stderr.strip()}')
+        if not result.stdout.strip(): raise ValueError('Tool did not report a version')
+
+
+def shared_label(path,recursive=False):
+    # Only this curated tools tree is shared with containers; host installs keep
+    # their original labels. New releases must also work in existing Podman containers.
+    if Path('/sys/fs/selinux/enforce').exists():
+        subprocess.run(['/usr/bin/chcon',*(['-R'] if recursive else []),'-t','container_file_t',str(path)],check=True)
+
+
+def publish(store,name,signature,build):
+    digest=hashlib.sha256(json.dumps(signature,sort_keys=True).encode()).hexdigest()[:20]
+    folder=store/name; releases=folder/'releases'; releases.mkdir(parents=True,exist_ok=True)
+    shared_label(folder); shared_label(releases)
+    release=releases/digest
+    if not release.exists():
+        with tempfile.TemporaryDirectory(prefix='.prepare-',dir=folder) as temp:
+            stage=Path(temp)/'release'; stage.mkdir()
+            build(stage)
+            (stage/'source.json').write_text(json.dumps(signature,indent=2)+'\n')
+            shared_label(stage,recursive=True)
+            stage.rename(release)
+        print(f'Published host {name}: {digest}',flush=True)
+    if (folder/'current').is_symlink() and (folder/'current').resolve()==release: return release
+    link=folder/'.current-new'; link.unlink(missing_ok=True)
+    link.symlink_to(Path('releases')/digest); link.replace(folder/'current')
+    return release
+
+
+def install_launchers(store):
+    scripts={
+        'codex':'release=$(readlink -f "$root/codex/current")\nexec "$release/bin/codex" "$@"\n',
+        'node':'runtime=$(readlink -f "$root/node/current")\nexec "$runtime/bin/node" "$@"\n',
+        'pi':'runtime=$(readlink -f "$root/node/current")\nrelease=$(readlink -f "$root/pi/current")\nexec "$runtime/bin/node" "$release/node_modules/'+PI_PACKAGE+'/dist/bundle/cli.js" "$@"\n',
+        'claude':'export DISABLE_AUTOUPDATER=1 DISABLE_UPDATES=1\nruntime=$(readlink -f "$root/node/current")\nrelease=$(readlink -f "$root/claude/current")\nexec "$release/bin/claude" "$@"\n',
+    }
+    bindir=store/'bin'; bindir.mkdir(exist_ok=True)
+    shared_label(bindir)
+    for name,body in scripts.items():
+        text='#!/bin/sh\nset -eu\nself=$(readlink -f -- "$0")\nroot=$(CDPATH= cd -- "$(dirname -- "$self")/.." && pwd)\nexport PATH="$root/bin:$PATH"\n'+body
+        dest=bindir/name
+        if dest.exists() and dest.read_text()==text: continue
+        temp=bindir/('.'+name); temp.write_text(text); temp.chmod(0o755); shared_label(temp); temp.replace(dest)
+
+
+def sync(store=STORE):
+    store.mkdir(parents=True,exist_ok=True)
+    if store.is_symlink() or store.resolve()!=store:
+        raise ValueError(f'Tools store must be a real canonical directory: {store}')
+    shared_label(store)
+    # The lock is outside the guest share. Guests never see a writable updater.
+    with (store.parent/'.agent-tools.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        sources={name:host_executable(name) for name in ('claude','codex','pi','node')}
+        for name,path in sources.items():
+            if not path.is_file() or path.resolve().is_relative_to(store):
+                raise ValueError(f'Host {name} executable missing or points into tools store: {path}')
+        patcher=shutil.which('patchelf')
+        if not patcher: raise ValueError('Host patchelf is required to prepare relocatable runtime copies')
+        claude=sources['claude'].resolve(); codex=sources['codex'].resolve(); node=sources['node'].resolve()
+        libs=sorted(set(library_files(node)+library_files(claude)))
+        runtime_sig={'node':stamp(node),'libraries':{str(p):stamp(p) for p in libs},'layout':3,'patchelf':stamp(Path(patcher))}
+        runtime_id=hashlib.sha256(json.dumps(runtime_sig,sort_keys=True).encode()).hexdigest()[:20]
+        guest_runtime=f'/opt/host-tools/node/releases/{runtime_id}'
+        def patch_binary(binary,rpath):
+            binary.chmod(0o755)
+            subprocess.run([patcher,'--set-interpreter',guest_runtime+'/lib/ld-linux-x86-64.so.2','--force-rpath','--set-rpath',rpath,str(binary)],check=True)
+        def build_runtime(dest):
+            (dest/'bin').mkdir(); (dest/'lib').mkdir()
+            shutil.copy2(node,dest/'bin/node')
+            for lib in libs:
+                target=dest/'lib'/lib.name
+                if target.exists(): raise ValueError(f'Duplicate runtime library: {lib.name}')
+                shutil.copy2(lib,target)
+            if not (dest/'lib/ld-linux-x86-64.so.2').is_file(): raise ValueError('Expected x86_64 glibc runtime loader')
+            patch_binary(dest/'bin/node','$ORIGIN/../lib')
+            verify([dest/'lib/ld-linux-x86-64.so.2','--library-path',dest/'lib',dest/'bin/node','--version'])
+            if runtime_sig!={'node':stamp(node),'libraries':{str(p):stamp(p) for p in libs},'layout':3,'patchelf':stamp(Path(patcher))}: raise ValueError('Host Node changed during publishing; retry')
+        runtime=publish(store,'node',runtime_sig,build_runtime)
+        loader=[runtime/'lib/ld-linux-x86-64.so.2','--library-path',runtime/'lib']
+        for name,source in [('claude',claude),('codex',codex)]:
+            # Codex ships sibling executables; publish the complete release bin directory.
+            files=sorted(p for p in source.parent.iterdir() if p.is_file()) if name=='codex' else [source]
+            signature={'files':{str(p):stamp(p) for p in files},'runtime':runtime_id if name=='claude' else None,'layout':2}
+            def build_native(dest,files=files,signature=signature,name=name):
+                (dest/'bin').mkdir()
+                for path in files: shutil.copy2(path,dest/'bin'/('claude' if name=='claude' else path.name))
+                if name=='claude': patch_binary(dest/'bin/claude',guest_runtime+'/lib')
+                verify((loader if name=='claude' else [])+[dest/'bin'/name,'--version'])
+                if signature!={'files':{str(p):stamp(p) for p in files},'runtime':runtime_id if name=='claude' else None,'layout':2}: raise ValueError('Host executable changed during publishing; retry')
+            publish(store,name,signature,build_native)
+        package=package_root(sources['pi']); modules=modules_root(package)
+        closure=package_closure(package)
+        signature={str(p):[stamp(p),stamp(p/'package.json')] for p in closure}
+        def build_pi(dest):
+            for source in closure:
+                target=dest/'node_modules'/source.relative_to(modules)
+                target.parent.mkdir(parents=True,exist_ok=True); copy_package(source,target)
+            verify(loader+[runtime/'bin/node',dest/'node_modules'/PI_PACKAGE/'dist/bundle/cli.js','--version'])
+            if signature!={str(p):[stamp(p),stamp(p/'package.json')] for p in closure}: raise ValueError('Host Pi changed during publishing; retry')
+        publish(store,'pi',signature,build_pi)
+        install_launchers(store)
+
+
+if __name__=='__main__':
+    try: sync()
+    except (OSError,ValueError,subprocess.SubprocessError) as error:
+        raise SystemExit(f'Host agent tools were not published: {error}')

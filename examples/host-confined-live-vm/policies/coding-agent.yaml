@@ -28,8 +28,11 @@ network_policies:
       - { host: llama-swap.home.shaytay.com, port: 9998, protocol: tcp }
     binaries:
       - { path: /usr/bin/node }
+      - { path: /opt/host-tools/node/releases/*/bin/node }
       - { path: /usr/bin/curl }
       - { path: /usr/bin/codex }
+      - { path: /opt/host-tools/codex/releases/*/bin/codex }
+      - { path: /opt/host-tools/claude/releases/*/bin/claude }
       - { path: /usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex }
   github_ssh:
     endpoints:
@@ -45,6 +48,7 @@ network_policies:
       - { host: r.jina.ai, port: 443, protocol: tcp }
     binaries:
       - { path: /usr/bin/node }
+      - { path: /opt/host-tools/node/releases/*/bin/node }
   npm_packages:
     endpoints:
       - { host: registry.npmjs.org, port: 443, protocol: tcp }
@@ -52,3 +56,4 @@ network_policies:
       - { path: /usr/local/bin/bun }
       - { path: /usr/bin/npm }
       - { path: /usr/bin/node }
+      - { path: /opt/host-tools/node/releases/*/bin/node }

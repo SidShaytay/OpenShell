@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenShell 0.1.7 host-confined MicroVM gateway
+Description=OpenShell host-confined MicroVM gateway
 
 [Service]
 Type=simple

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Launch a live project in a host-confined MicroVM; recover older snapshots."""
-import shlex
+"""Launch a live-shared project in a host-confined sandbox."""
 import argparse
 from collections import Counter
 import hashlib
@@ -23,19 +22,21 @@ MODULE = Path(__file__).resolve().parents[1]
 ROOT = Path('/mnt/data/projects').resolve()
 STATE = Path.home()/'.local/state/openshell-project'
 IMAGE = 'localhost/openshell-agent-dev:v0.1.2'
-AGENT_SETUP_VERSION = 3  # Also repair missing Codex system-skill links.
+TOOLS = Path.home()/'.local/share/openshell/agent-tools'
+AGENTS = {'pi':'pi','codex':'codex','claude':'claude','shell':'bash'}
+AGENT_SETUP_VERSION = 4  # Also repair missing Codex system-skill links.
 CHROMIUM_HELPER = 'agent-chromium-path'
 DESKTOP_PORT = 6080
-LANES = {'podman': ('podman', 'openshell-v0.1.2-podman.service'),
-         'vm': ('vm', 'openshell-v0.1.2-vm.service')}
+LANES = {'podman': ('podman', 'openshell-podman.service'),
+         'vm': ('vm', 'openshell-vm.service')}
 LABEL = 'system_u:object_r:container_file_t:s0'
 PROJECT_EXCLUDES = {'.git', 'node_modules'}
 
 def run(args, **kw):
     return subprocess.run([str(x) for x in args], check=True, **kw)
 
-def output(args):
-    return run(args,capture_output=True,text=True).stdout.strip()
+def output(args, **kw):
+    return run(args,capture_output=True,text=True,**kw).stdout.strip()
 
 def entries(root, include_dependencies=False, include_git=False):
     excluded=set(PROJECT_EXCLUDES)
@@ -76,27 +77,7 @@ def audit(root, labels=False, include_dependencies=False, include_git=False):
     if any(seen[k]!=v for k,v in links.items()):
         raise ValueError('hard link has a name outside the selected project')
 
-def manifest(root):
-    result={}
-    for p in entries(root):
-        s=p.lstat(); name=str(p.relative_to(root))
-        if p.is_symlink(): result[name]={'link':os.readlink(p)}
-        elif p.is_file(): result[name]={'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'mode':stat.S_IMODE(s.st_mode)}
-    return result
-
-def runtime_for(m):
-    return m.get('runtime', 'vm' if m['gateway'] in ['openshell','vm'] else 'podman')
-
-def snapshot_session(m):
-    # Records predating live sharing are snapshots; never change their meaning.
-    return runtime_for(m)=='vm' and m.get('project_mode','snapshot')=='snapshot'
-
-def require_snapshot(m):
-    if not snapshot_session(m):
-        raise ValueError('This session uses a live host folder; changes are already on the host. Use Git diff there, not collect/apply.')
-
 def cli(gateway,*args):
-    gateway={'openshell':'vm','podman-v012':'podman'}.get(gateway,gateway)
     return ['openshell','--gateway',gateway,*args]
 
 def https_origin(value):
@@ -133,7 +114,7 @@ def is_named_session(name):
     return re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6}',name) is not None
 
 def allow_origin(session,origin):
-    folder,m=meta(session); rt=runtime_for(m)
+    folder,m=meta(session); rt=m['runtime']
     if session not in live_names(rt): raise ValueError(f'Sandbox {session} is not running')
     canonical,host,port=https_origin(origin)
     allowed=m.setdefault('browser_origins',{})
@@ -152,7 +133,7 @@ def allow_origin(session,origin):
     print(f'Allowed Chromium read/write access to {canonical} for {session}. Subdomains require separate osh allow commands.')
 
 def revoke_origin(session,origin):
-    folder,m=meta(session); rt=runtime_for(m)
+    folder,m=meta(session); rt=m['runtime']
     if session not in live_names(rt): raise ValueError(f'Sandbox {session} is not running')
     canonical,host,port=https_origin(origin)
     allowed=m.get('browser_origins',{})
@@ -166,7 +147,7 @@ def revoke_origin(session,origin):
     print('Existing browser connections may remain open. Close and reopen the guest browser to enforce this revocation on new connections.')
 
 def forward_service(session,target_port,local_port=None,browser=False):
-    _,m=meta(session); rt=runtime_for(m)
+    _,m=meta(session); rt=m['runtime']
     if session not in live_names(rt): raise ValueError(f'Sandbox {session} is not running')
     try: target=int(target_port); local=target if local_port is None else int(local_port)
     except (TypeError,ValueError) as e: raise ValueError('ports must be integers from 1 to 65535') from e
@@ -185,114 +166,24 @@ def browser_view(session):
     return forward_service(session,DESKTOP_PORT,DESKTOP_PORT,browser=True)
 
 def meta(session):
-    valid_legacy=re.fullmatch(r'project-[a-zA-Z0-9_-]+',session) is not None
-    valid_named=is_named_session(session)
-    if not (valid_legacy or valid_named):
+    if not is_named_session(session):
         raise ValueError('invalid session name')
     folder=STATE/session
+    if folder.is_symlink() or folder.resolve().parent!=STATE.resolve():
+        raise ValueError('session directory must be directly beneath the osh state directory')
+    if (folder/'session.json').is_symlink(): raise ValueError('session record must not be a symlink')
     m=json.loads((folder/'session.json').read_text())
     return folder,m
 
-def collect(session):
-    folder,m=meta(session)
-    require_snapshot(m)
-    target=folder/('download-'+secrets.token_hex(3)); target.mkdir(mode=0o700)
-    run(cli(m['gateway'],'sandbox','download',session,'/sandbox/project',target))
-    candidates=[target/'project',target]
-    root=next((x for x in candidates if (x/'.git').exists()),None)
-    if root is None: raise ValueError(f'cannot identify downloaded project in {target}; sandbox retained')
-    audit(root)
-    m['review']=str(root); m['result']=manifest(root)
-    (folder/'session.json').write_text(json.dumps(m,indent=2)+'\n')
-    delta=changes(m)
-    print(f'{len(delta)} changed files. Review copy: {root}')
-    print(f'osh diff {session} | osh apply {session} | osh reenter {session}')
-
-def changes(m):
-    base=m['baseline']; result=m['result']
-    return [(n,'delete' if n not in result else 'add' if n not in base else 'modify') for n in sorted(base.keys()|result.keys()) if base.get(n)!=result.get(n)]
-
-def review(session,apply=False):
-    folder,m=meta(session)
-    require_snapshot(m)
-    if 'review' not in m: raise ValueError('collect results first')
-    host=Path(m['host']); source=Path(m['review'])
-    audit(source)
-    if manifest(source)!=m['result']: raise ValueError('review files changed since collection; collect again')
-    delta=changes(m)
-    for n,kind in delta: print(f'{kind}: {n}')
-    if not apply: return
-    if not host.resolve().is_relative_to(ROOT) or host.resolve()==ROOT: raise ValueError('invalid host project')
-    audit(host,labels=True)
-    current=manifest(host)
-    conflicts=[n for n,_ in delta if current.get(n)!=m['baseline'].get(n) and current.get(n)!=m['result'].get(n)]
-    if conflicts:
-        guidance=['Host/VM conflicts: '+', '.join(conflicts), 'Nothing applied. VM and review copies retained.', 'Compare current host (destination) with VM result (source):']
-        for n in conflicts:
-            guidance += [f'  Host: {host/n}', f'  VM result: {source/n}', '  diff -u -- '+shlex.quote(str(host/n))+' '+shlex.quote(str(source/n))]
-        guidance += ['For added/deleted files, one path may be absent. Resolve each conflict manually into the host checkout; keep any host edits you need.', 'Do not edit the review snapshot: its integrity is checked. Rerun osh apply '+session+' only if each conflict now matches the VM result. If you create a different manual merge, complete the remaining changes manually; apply will continue to refuse that file. After verifying the host, osh delete --discard '+session+' removes the VM while preserving host edits.', 'To keep working in the VM: osh reenter '+session]
-        raise ValueError('\n'.join(guidance))
-    delta=[(n,k) for n,k in delta if current.get(n)!=m['result'].get(n)]
-    if not delta:
-        print('No unapplied changes.'); return
-    # Existing parents must be real directories: never follow a replaced parent symlink.
-    for n,_ in delta:
-        p=host/n
-        for parent in p.parents:
-            if parent==host: break
-            if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
-                raise ValueError(f'unsafe destination parent: {parent}')
-    backup=folder/('before-apply-'+secrets.token_hex(3)); backup.mkdir(mode=0o700,exist_ok=False)
-    for n,_ in delta:
-        p=host/n
-        if p.exists() or p.is_symlink():
-            b=backup/n; b.parent.mkdir(parents=True,exist_ok=True)
-            shutil.copy2(p,b,follow_symlinks=False)
-    for n,kind in delta:
-        p=host/n
-        if p.exists() or p.is_symlink():
-            if p.is_dir() and not p.is_symlink(): raise ValueError(f'directory conflicts with file: {p}')
-            p.unlink()
-        if kind!='delete':
-            p.parent.mkdir(parents=True,exist_ok=True)
-            # Keep the destination project label; review xattrs are not trusted.
-            shutil.copy(source/n,p,follow_symlinks=False)
-    print(f'Applied {len(delta)} changes; previous files: {backup}. Sandbox retained.')
-
-def vm_exit(session):
-    collect(session)
-    folder,m=meta(session)
-    if not changes(m):
-        print(f"No project files changed in microVM {session}; no copy-back needed.\nHost checkout: {m['host']} (unchanged).\nMicroVM retained: osh reenter {session}\nHost review copy: {m['review']}")
-        return
-    print(f"Host destination: {m['host']}\nMicroVM {session} source: /sandbox/project (host review: {m['review']})")
-    try:
-        answer=input('Copy project changes FROM VM => host? [yes/no; Enter retains VM] ').strip().lower()
-        if answer in ('y','yes'):
-            review(session,True)
-            return
-        if answer not in ('n','no'):
-            print('Cancelled; VM and review files retained.'); return
-        if changes(m):
-            confirm=input('VM files changed. Delete this VM and its review downloads, losing those copies? Type discard to confirm: ').strip()
-            if confirm!='discard':
-                print('Discard cancelled; VM and review files retained.'); return
-        run(cli(m['gateway'],'sandbox','delete',session))
-        for download in folder.glob('download-*'):
-            if download.is_dir() and not download.is_symlink(): shutil.rmtree(download)
-        m.pop('review',None); m.pop('result',None)
-        m['discarded']=True
-        (folder/'session.json').write_text(json.dumps(m,indent=2)+'\n')
-        print(f"Deleted microVM {session}, including its /sandbox/project copy.\nRemoved host review downloads: {folder}/download-*\nHost checkout unchanged: {m['host']}\nAny host apply backups remain at: {folder}/before-apply-*\nSession record remains at: {folder}/session.json")
-    except (EOFError,KeyboardInterrupt):
-        print('\nNo confirmation received; VM and review files retained.')
-
 def provision_agents(session,gateway):
     """Copy shared resources, never host auth/history; materialize host symlinks."""
+    print('Preparing agent setup (copied into the sandbox):',flush=True)
     with tempfile.TemporaryDirectory() as temp:
         bundle=Path(temp)/'osh-agent-setup'; bundle.mkdir()
         skills=Path.home()/'.agents/skills'
+        print('  Skills',flush=True)
         shutil.copytree(skills,bundle/'skills',symlinks=False)
+        print('  Browser instructions',flush=True)
         browser=bundle/'browser'; browser.mkdir()
         (browser/'AGENTS.playwright-cli.md').write_text("""# Browser use inside the OpenShell sandbox
 
@@ -310,7 +201,13 @@ This supplement replaces host-specific browser paths and machine access rules fo
 """)
         pi=Path.home()/'.pi/agent'; target=bundle/'pi-agent'; target.mkdir()
         for name in ['extensions','npm','git','themes','pi-subagents']:
-            if (pi/name).exists(): shutil.copytree(pi/name,target/name,symlinks=False,ignore=shutil.ignore_patterns('.git'))
+            label={'extensions':'Pi extensions','npm':'Pi npm packages','git':'Pi Git packages','themes':'Pi themes','pi-subagents':'Pi subagents'}[name]
+            if (pi/name).exists():
+                print(f'  {label}',flush=True)
+                shutil.copytree(pi/name,target/name,symlinks=False,ignore=shutil.ignore_patterns('.git'))
+            else:
+                print(f'  {label}: skipped (not present)',flush=True)
+        print('  Pi settings',flush=True)
         settings=json.loads((pi/'settings.json').read_text())
         # Only package-discovery settings: sandbox provider/model remain local.
         settings={k:settings[k] for k in ['packages','theme','steeringMode','followUpMode','subagents'] if k in settings}
@@ -319,9 +216,20 @@ This supplement replaces host-specific browser paths and machine access rules fo
         settings['llama-swap']={'url':'http://llama-swap.home.shaytay.com:9998','fallbackModel':'qwen3.8-27b'}
         (target/'settings.json').write_text(json.dumps(settings,indent=2)+'\n')
         for name in ['APPEND_SYSTEM.md']:
-            if (pi/name).is_file(): shutil.copy2(pi/name,target/name)
+            if (pi/name).is_file():
+                print('  Pi system instructions',flush=True)
+                shutil.copy2(pi/name,target/name)
+        print('Uploading the agent setup bundle (skills and agent configuration).',flush=True)
         run(cli(gateway,'sandbox','upload','--no-git-ignore',session,bundle,'/sandbox'))
     setup="""set -eu
+mkdir -p /home/agent/.local/bin
+for tool in claude codex pi node; do
+  ln -sfn /opt/host-tools/bin/$tool /home/agent/.local/bin/$tool
+done
+touch /home/agent/.bashrc
+if ! grep -q '^export PATH=/opt/host-tools/bin:' /home/agent/.bashrc; then
+  printf '\nexport PATH=/opt/host-tools/bin:$PATH\n' >> /home/agent/.bashrc
+fi
 mkdir -p /home/agent/.agents /home/agent/.codex /home/agent/.pi /home/agent/.config/agents
 ln -sfn /sandbox/osh-agent-setup/skills /home/agent/.agents/skills
 mkdir -p /home/agent/.codex/skills
@@ -341,6 +249,7 @@ rm -rf /home/agent/.pi/agent
 ln -s /tmp/pi-agent /home/agent/.pi/agent
 """
     run(cli(gateway,'sandbox','exec','--name',session,'--','bash','-c',setup))
+    print('Agent setup complete.',flush=True)
     folder,m=meta(session); m['agent_setup']=AGENT_SETUP_VERSION
     (folder/'session.json').write_text(json.dumps(m,indent=2)+'\n')
 
@@ -370,8 +279,9 @@ def launch(a):
     key=Path.home()/'.local/share/openshell/stage/ssh/id_ed25519'; known=key.with_name('known_hosts')
     if ssh and not (key.is_file() and known.is_file()): raise ValueError('dedicated SSH staging is missing')
     origins=[https_origin(x)[0] for x in (a.allow or [])]
-    print(f'Project: {host}\nRuntime: {a.runtime}\nGateway: {gateway}\nProvider: {provider or "none"}\nSSH: {ssh}\nImage: {image}',flush=True)
+    print(f'Project: {host} (live-shared, read/write; edits immediately affect host files)\nRuntime: {a.runtime}\nGateway: {gateway}\nProvider: {provider or "none"}\nGit SSH credentials: {"enabled (dedicated staged key)" if ssh else "disabled (no key staged)"}\nHost tools: live, read-only at /opt/host-tools\nImage: {image}',flush=True)
     if a.check: return
+    run([MODULE/'scripts/openshell-agent-tools'])
     env=os.environ.copy(); env.setdefault('XDG_RUNTIME_DIR',f'/run/user/{os.getuid()}'); env.setdefault('DBUS_SESSION_BUS_ADDRESS',f'unix:path={env["XDG_RUNTIME_DIR"]}/bus')
     run(['systemctl','--user','start','podman.socket',unit],env=env)
     for attempt in range(30):
@@ -386,15 +296,17 @@ def launch(a):
     else: raise ValueError('could not allocate a unique session name')
     create=cli(gateway,'sandbox','create','--name',session,'--from',image,'--policy',MODULE/'policies/coding-agent.yaml')
     if provider: create += ['--provider',provider]
-    mounts=[{'type':'bind','source':str(host),'target':workdir,'read_only':False}]
+    mounts=[{'type':'bind','source':str(host),'target':workdir,'read_only':False},
+            {'type':'bind','source':str(TOOLS),'target':'/opt/host-tools','read_only':True}]
+    if a.runtime=='podman': mounts[1]['selinux_label']='shared'
     if a.runtime=='podman' and ssh:
         mounts += [{'type':'bind','source':str(p),'target':'/home/agent/.ssh/'+p.name,'read_only':True} for p in [key,known]]
     create += ['--driver-config-json',json.dumps({a.runtime:{'mounts':mounts}})]
-    create += ['--detach','--','agent-entrypoint','sleep','infinity']
+    create += ['--env','PATH=/opt/host-tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','--detach','--','agent-entrypoint','sleep','infinity']
     print(f'Session: {session}',flush=True)
     STATE.mkdir(mode=0o700,parents=True,exist_ok=True)
     folder=STATE/session; folder.mkdir(mode=0o700)
-    m={'host':str(host),'gateway':gateway,'runtime':a.runtime,'image':image,'workdir':workdir,'project_mode':'live','browser_origins':{}}
+    m={'host':str(host),'gateway':gateway,'runtime':a.runtime,'image':image,'workdir':workdir,'browser_origins':{}}
     (folder/'session.json').write_text(json.dumps(m,indent=2)+'\n')
     try:
         policy_path=folder/'policy.yaml'
@@ -405,15 +317,15 @@ def launch(a):
         if a.runtime=='vm' and ssh:
             for p in [key,known]: run(cli(gateway,'sandbox','upload',session,p,'/home/agent/.ssh/'+p.name))
         provision_agents(session,gateway)
-        command={'pi':'pi','codex':'codex','shell':'bash'}[a.agent]
+        command=AGENTS[a.agent]
         args=a.args[1:] if a.args[:1]==['--'] else a.args
         guest=['agent-entrypoint','bash','-c','cd -- "$1" && shift && exec "$@"','project-command',workdir,command,*args]
         rc=subprocess.run(cli(gateway,'sandbox','exec','--name',session,'--',*guest)).returncode
         print('Live project edits are already saved on the host.',flush=True)
         return rc
     finally:
-        if a.runtime=='podman' and not a.keep: run(cli(gateway,'sandbox','delete',session))
-        elif not meta(session)[1].get('discarded'): print(f'Sandbox retained: {session}; use osh reenter or osh delete with {session}',flush=True)
+        if a.runtime=='podman' and not a.keep: delete_session(session)
+        elif folder.exists(): print(f'Sandbox retained: {session}\nReenter: osh reenter {session}\nDelete sandbox (host project files remain): osh delete {session}',flush=True)
 
 def live_names(runtime):
     gateway,_=LANES[runtime]
@@ -425,7 +337,7 @@ def live_names(runtime):
     for record in STATE.glob('*/session.json'):
         try:
             name=record.parent.name; m=json.loads(record.read_text())
-            if runtime_for(m)==runtime and not m.get('discarded'): recorded[name]=True
+            if m['runtime']==runtime: recorded[name]=True
         except (OSError,ValueError,KeyError): pass
     listed={line.strip() for line in r.stdout.splitlines() if line.strip()}
     return listed & recorded.keys()
@@ -437,7 +349,7 @@ def resolve_session(value=None):
         matches=[]
         for record in STATE.glob('*/session.json'):
             name=record.parent.name
-            tail=name.rsplit('-',1)[-1] if is_named_session(name) else name.removeprefix('project-')
+            tail=name.rsplit('-',1)[-1]
             if name.startswith(value) or tail.startswith(value): matches.append(name)
         if len(matches)==1: return matches[0]
         raise ValueError('Session not found or prefix ambiguous; use osh list')
@@ -470,8 +382,7 @@ def list_sessions():
         for name in sorted(live_names(rt)):
             try:
                 _,m=meta(name)
-                mode='snapshot' if snapshot_session(m) else 'live'
-                print(f"  {name}: {m['host']} [{mode}] | osh reenter {name}")
+                print(f"  {name}: {m['host']} [live-shared] | osh reenter {name}")
             except (OSError,ValueError): pass
 
 def session_action(action,argv):
@@ -481,33 +392,79 @@ def session_action(action,argv):
     return allow_origin(session,a.url) if action=='allow' else revoke_origin(session,a.url)
 
 def enter(session,agent='shell',args=()):
-    _,m=meta(session); rt=runtime_for(m)
-    if session not in live_names(rt): raise ValueError('Sandbox no longer exists; downloaded review copies remain on the host')
+    _,m=meta(session); rt=m['runtime']
+    if session not in live_names(rt):
+        raise ValueError(f'Sandbox no longer exists. Clean up its session files with: osh delete {session}')
     if m.get('agent_setup') != AGENT_SETUP_VERSION: provision_agents(session,m['gateway'])
-    command={'shell':'bash','pi':'pi','codex':'codex'}[agent]
-    workdir=m.get('workdir','/sandbox/project' if rt=='vm' else '/workspace')
+    command=AGENTS[agent]
+    workdir=m['workdir']
     guest=['agent-entrypoint','bash','-c','cd -- "$1" && shift && exec "$@"','osh-command',workdir,command,*args]
     rc=subprocess.run(cli(m['gateway'],'sandbox','exec','--name',session,'--',*guest)).returncode
-    if snapshot_session(m): vm_exit(session)
-    if not meta(session)[1].get('discarded'): print(f'Session retained: {session}')
+    print(f'Sandbox kept. Reenter: osh reenter {session}\nDelete sandbox: osh delete {session}')
     return rc
 
-def delete_session(session,discard=False):
-    _,m=meta(session)
-    if snapshot_session(m) and not discard:
-        # Refresh before deletion: applying an earlier download does not protect newer VM edits.
-        collect(session); _,m=meta(session)
-        current=manifest(Path(m['host']))
-        pending=[n for n,_ in changes(m) if current.get(n)!=m['result'].get(n)]
-        if pending:
-            raise ValueError('VM work is not applied: '+', '.join(pending)+'. VM and downloads retained. Use osh diff/apply, or explicitly osh delete --discard SESSION.')
-    run(cli(m['gateway'],'sandbox','delete',session))
-    print('Sandbox deleted; downloaded review copies and backups retained.')
+def sandbox_records(gateway):
+    records=[]; token=''; seen=set()
+    while True:
+        args=cli(gateway,'sandbox','list','-o','json')
+        if token: args += ['--page-token',token]
+        page=json.loads(output(args,timeout=10))
+        records.extend(page['sandboxes'])
+        token=page['next_page_token']
+        if not token: return records
+        if token in seen: raise ValueError('gateway repeated a sandbox list page token')
+        seen.add(token)
+
+def wait_for_deletion(session,gateway,sandbox_id):
+    deadline=time.monotonic()+120
+    while True:
+        try:
+            records=sandbox_records(gateway)
+        except (subprocess.SubprocessError,OSError,ValueError,KeyError) as error:
+            raise ValueError(f'Deletion of {session} was not confirmed: cannot check gateway cleanup. Run osh list to check its status.') from error
+        if not any(r['id']==sandbox_id for r in records): return
+        if time.monotonic()>=deadline:
+            raise ValueError(f'Deletion of {session} was not confirmed within 120 seconds. Gateway cleanup is still pending; run osh list to check its status.')
+        time.sleep(0.5)
+
+def cleanup_host_artifacts(folder,host):
+    print(f'Host project kept: {host}')
+    extra=[p for p in folder.iterdir() if p.name not in ('session.json','policy.yaml')]
+    if extra:
+        print('Session record kept because these additional files remain:')
+        for path in sorted(extra): print(f'  {path}')
+        return
+    for name in ('policy.yaml','session.json'):
+        (folder/name).unlink(missing_ok=True)
+    folder.rmdir()
+    print(f'Removed session files: {folder}')
+
+def delete_session(session):
+    folder,m=meta(session)
+    records=sandbox_records(m['gateway'])
+    sandbox_id=next((r['id'] for r in records if r['name']==session),None)
+    if sandbox_id is None:
+        print(f'Sandbox {session} is already deleted.')
+        cleanup_host_artifacts(folder,m['host'])
+        return
+    print(f'Deleting sandbox {session}; waiting for cleanup...',flush=True)
+    try:
+        run(cli(m['gateway'],'sandbox','delete',session),capture_output=True,text=True,timeout=120)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f'Deletion of {session} was not confirmed: the gateway request timed out. Run osh list to check its status.') from error
+    except subprocess.CalledProcessError as error:
+        detail=(error.stderr or error.stdout or str(error)).strip()
+        raise ValueError(f'Deletion of {session} failed: {detail}') from error
+    wait_for_deletion(session,m['gateway'],sandbox_id)
+    print('Sandbox deleted; host project files remain.')
+    cleanup_host_artifacts(folder,m['host'])
 
 EXAMPLES = """Common commands (run from your project directory):
   osh                    New host-confined MicroVM with live project sharing
   osh pi                 Pi with live project access in a MicroVM
   osh codex              Codex with live project access in a MicroVM
+  osh claude             Claude with live project access in a MicroVM
+  osh tools              Publish current host tools to all tools-enabled VMs
   osh podman             Explicit live Podman shell
   osh podman pi          Explicit Pi with live project access
   osh list               List both runtimes and session names
@@ -515,17 +472,14 @@ EXAMPLES = """Common commands (run from your project directory):
   osh reenter icloud-md-a1b2c3  Reenter by project slug and six-character ID
   osh reenter a1b2c3       Reenter by unique six-character ID
   osh reenter SESSION pi   Run Pi in that same sandbox
-  osh diff SESSION       Review a legacy snapshot session
-  osh apply SESSION      Apply a legacy snapshot; refuse host conflicts
   osh delete SESSION     Delete VM; live project files remain on host
-  osh delete --discard SESSION  Explicitly discard the VM (downloads remain)
   osh vm --allow https://docs.example.com  Allow Chromium on that HTTPS origin
   osh allow icloud-md-a1b2c3 https://api.example.com  Add a live allowance
   osh revoke icloud-md-a1b2c3 https://api.example.com Remove that allowance
   osh browser icloud-md-a1b2c3  Stream its Chromium desktop through localhost
   osh forward icloud-md-a1b2c3 3000  Forward its app port to host loopback
   osh --check            Check the current project without starting a sandbox
-New sessions share only the selected project live: edits reach the host immediately, with no copy-back prompt. VM sessions stay available for reentry. Legacy snapshots retain their review/apply safeguards.
+Projects are live-shared: edits reach the host immediately. Agent tools come from the live read-only host tools share. VM sessions stay available for reentry.
 Full Chromium sandboxing is blocked by OpenShell v0.1.2. Explicit interim candidate images disable the inner Chromium sandbox for compatibility testing. App forwarding works independently.
 Browser allowances authorize Chromium read/write requests across one HTTPS origin; paths and subdomains are not filtered or implied. Local app ports are forwarded to host loopback only. `osh browser` starts a host-loopback viewer tunnel to the sandbox's headed Chromium desktop; the agent must use headed Chromium for its actions to appear there.
 """
@@ -533,7 +487,11 @@ Browser allowances authorize Chromium read/write requests across one HTTPS origi
 def main(argv=None):
     argv=list(sys.argv[1:] if argv is None else argv)
     if argv[:1]==['run']: argv=argv[1:]
-    actions=['list','reenter','collect','diff','apply','delete','allow','revoke','browser','forward']
+    if argv[:1]==['tools']:
+        parser=argparse.ArgumentParser(prog='osh tools',description='Publish host-installed agents to the live read-only tools share.')
+        parser.parse_args(argv[1:]); run([MODULE/'scripts/openshell-agent-tools'])
+        print(f'Host tools published at: {TOOLS}'); return
+    actions=['list','reenter','delete','allow','revoke','browser','forward']
     if argv and argv[0] in actions:
         action=argv.pop(0)
         if action in ('allow','revoke'): return session_action(action,argv)
@@ -546,15 +504,12 @@ def main(argv=None):
             a=parser.parse_args(argv); return forward_service(resolve_session(a.session),a.port,a.local_port)
         parser=argparse.ArgumentParser(prog='osh '+action,epilog=EXAMPLES,formatter_class=argparse.RawDescriptionHelpFormatter)
         if action=='list': parser.parse_args(argv); return list_sessions()
-        parser.add_argument('--discard',action='store_true') if action=='delete' else None
         parser.add_argument('session',nargs='?' if action=='reenter' else None)
         if action=='reenter':
-            parser.add_argument('agent',choices=['shell','pi','codex'],nargs='?',default='shell'); parser.add_argument('args',nargs=argparse.REMAINDER)
+            parser.add_argument('agent',choices=list(AGENTS),nargs='?',default='shell'); parser.add_argument('args',nargs=argparse.REMAINDER)
         a=parser.parse_args(argv); session=resolve_session(a.session)
         if action=='reenter': return enter(session,a.agent,a.args[1:] if a.args[:1]==['--'] else a.args)
-        if action=='collect': return collect(session)
-        if action in ['diff','apply']: return review(session,action=='apply')
-        return delete_session(session,a.discard)
+        return delete_session(session)
     rt='vm'
     if argv and argv[0] in LANES: rt=argv.pop(0)
     parser=argparse.ArgumentParser(prog='osh',description='Open a live project in a host-confined MicroVM (default). Edits immediately affect host files.',epilog=EXAMPLES,formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -563,7 +518,7 @@ def main(argv=None):
     parser.add_argument('--allow',action='append',default=[],metavar='HTTPS_ORIGIN',help='allow Chromium read/write access to every path on one HTTPS origin; repeat for more origins')
     parser.add_argument('--image',help='use a candidate OCI image instead of the configured default')
     parser.add_argument('--check',action='store_true'); parser.add_argument('--keep',action='store_true',help='retain a Podman session; VM sessions are always retained')
-    parser.add_argument('agent',choices=['pi','codex','shell'],nargs='?',default='shell'); parser.add_argument('args',nargs=argparse.REMAINDER)
+    parser.add_argument('agent',choices=list(AGENTS),nargs='?',default='shell'); parser.add_argument('args',nargs=argparse.REMAINDER)
     return launch(parser.parse_args(argv))
 
 if __name__=='__main__':

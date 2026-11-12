@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import io
 from pathlib import Path
 import re
 import tempfile
@@ -26,45 +27,9 @@ class WorkflowTests(unittest.TestCase):
         (self.host/'.env.production').write_text('placeholder')
         with self.assertRaises(ValueError): w.audit(self.host)
     def session(self):
-        folder=self.root/'state'/'project-test'; folder.mkdir(parents=True)
-        m={'host':str(self.host),'gateway':'vm','runtime':'vm','baseline':w.manifest(self.host),'review':str(self.source),'result':w.manifest(self.source)}
+        folder=self.root/'state'/'project-a1b2c3'; folder.mkdir(parents=True)
+        m={'host':str(self.host),'gateway':'vm','runtime':'vm','project_mode':'live','workdir':str(self.host)}
         (folder/'session.json').write_text(json.dumps(m)); return folder
-    def call_apply(self):
-        original=w.audit
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'ROOT',self.root/'projects'),patch.object(w,'audit',lambda r,labels=False:original(r)):
-            w.review('project-test',True)
-    def test_add_modify_delete(self):
-        (self.host/'modified').write_text('before'); (self.host/'removed').write_text('delete me')
-        (self.source/'modified').write_text('after'); (self.source/'added').write_text('new')
-        folder=self.session(); self.call_apply()
-        self.assertEqual((self.host/'modified').read_text(),'after'); self.assertFalse((self.host/'removed').exists())
-        self.assertEqual((self.host/'added').read_text(),'new'); self.assertEqual(next(folder.glob('before-apply-*/removed')).read_text(),'delete me')
-    def test_apply_does_not_import_snapshot_xattrs(self):
-        import os
-        (self.source/'added').write_text('new')
-        os.setxattr(self.source/'added', 'user.osh-snapshot', b'review-only')
-        self.session(); self.call_apply()
-        self.assertEqual((self.host/'added').read_text(), 'new')
-        self.assertNotIn('user.osh-snapshot', os.listxattr(self.host/'added'))
-
-    def test_dependency_trees_are_excluded_from_audit_and_copyback(self):
-        import shutil
-        (self.host/'source.ts').write_text('source')
-        dependencies=self.host/'node_modules'/'sdk'/'credentials'
-        dependencies.mkdir(parents=True)
-        (dependencies/'auth.json').write_text('host dependency fixture')
-        (self.host/'node_modules'/'external').symlink_to('/etc')
-        w.audit(self.host)
-        self.assertEqual(set(w.manifest(self.host)), {'source.ts'})
-        snapshot=self.root/'snapshot'
-        shutil.copytree(self.host,snapshot,symlinks=True,ignore=shutil.ignore_patterns(*w.PROJECT_EXCLUDES))
-        self.assertFalse((snapshot/'node_modules').exists())
-        (self.source/'source.ts').write_text('source')
-        generated=self.source/'node_modules'/'generated'
-        generated.mkdir(parents=True); (generated/'auth.json').write_text('guest dependency fixture')
-        self.session(); self.call_apply()
-        self.assertFalse((self.host/'node_modules'/'generated').exists())
-        self.assertEqual((dependencies/'auth.json').read_text(),'host dependency fixture')
 
     def test_dependency_credentials_source_directory_is_audited_not_rejected(self):
         source=self.host/'node_modules'/'sdk'/'lib'/'credentials'; source.mkdir(parents=True)
@@ -79,40 +44,72 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             w.audit(self.host,include_dependencies=True)
 
-    def test_host_conflict_rejected(self):
-        (self.host/'file').write_text('before'); (self.source/'file').write_text('agent')
-        self.session(); (self.host/'file').write_text('concurrent')
-        with self.assertRaises(ValueError): self.call_apply()
-        self.assertEqual((self.host/'file').read_text(),'concurrent')
-    def test_review_tamper_rejected(self):
-        (self.source/'file').write_text('agent'); self.session(); (self.source/'file').write_text('changed')
-        with self.assertRaises(ValueError): self.call_apply()
-        self.assertFalse((self.host/'file').exists())
+    def test_delete_waits_for_original_sandbox_removal(self):
+        folder=self.session(); record=folder/'session.json'
+        m=json.loads(record.read_text()); m['project_mode']='live'; record.write_text(json.dumps(m))
+        original={'id':'old','name':'project-a1b2c3'}
+        replacement={'id':'new','name':'project-a1b2c3'}
+        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'run'),patch.object(w,'sandbox_records',side_effect=[[original],[original],[replacement]]),patch.object(w.time,'sleep') as sleep,patch('sys.stdout',new_callable=io.StringIO) as out:
+            w.delete_session('project-a1b2c3')
+        sleep.assert_called_once()
+        self.assertIn('Sandbox deleted; host project files remain.',out.getvalue())
 
-    def test_unrelated_host_edit_allowed(self):
-        (self.host/'agent-file').write_text('before'); (self.source/'agent-file').write_text('after')
-        (self.host/'host-file').write_text('before'); (self.source/'host-file').write_text('before')
-        self.session(); (self.host/'host-file').write_text('host changed')
-        self.call_apply()
-        self.assertEqual((self.host/'host-file').read_text(),'host changed')
-        self.assertEqual((self.host/'agent-file').read_text(),'after')
-    def test_apply_idempotent(self):
-        (self.host/'file').write_text('before'); (self.source/'file').write_text('after')
-        self.session(); self.call_apply(); self.call_apply()
-        self.assertEqual((self.host/'file').read_text(),'after')
-    def test_delete_blocks_unapplied_vm_work(self):
-        (self.host/'file').write_text('before'); (self.source/'file').write_text('after')
+    def test_delete_timeout_does_not_claim_completion(self):
         self.session()
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'collect'),patch.object(w,'run') as run:
-            with self.assertRaises(ValueError): w.delete_session('project-test')
-            run.assert_not_called()
-        self.assertEqual((self.host/'file').read_text(),'before')
-        self.assertEqual((self.source/'file').read_text(),'after')
-    def test_delete_after_apply(self):
-        (self.host/'file').write_text('same'); (self.source/'file').write_text('same')
+        original={'id':'old','name':'project-a1b2c3'}
+        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'run'),patch.object(w,'sandbox_records',return_value=[original]),patch.object(w.time,'monotonic',side_effect=[0,121]),patch('sys.stdout',new_callable=io.StringIO) as out:
+            with self.assertRaisesRegex(ValueError,'not confirmed'):
+                w.delete_session('project-a1b2c3')
+        self.assertNotIn('Sandbox deleted;',out.getvalue())
+
+    def test_delete_gateway_failure_does_not_claim_completion(self):
+        import subprocess
         self.session()
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'collect'),patch.object(w,'run') as run:
-            w.delete_session('project-test'); run.assert_called_once()
+        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'run'),patch.object(w,'sandbox_records',side_effect=OSError('gateway unavailable')),patch('sys.stdout',new_callable=io.StringIO) as out:
+            with self.assertRaisesRegex(ValueError,'not confirmed'):
+                w.wait_for_deletion('project-a1b2c3','vm','old')
+        self.assertNotIn('Sandbox deleted;',out.getvalue())
+
+    def test_sandbox_records_reads_all_pages(self):
+        pages=[{'sandboxes':[{'id':'one'}],'next_page_token':'next'}, {'sandboxes':[{'id':'two'}],'next_page_token':''}]
+        with patch.object(w,'output',side_effect=[json.dumps(p) for p in pages]) as output:
+            self.assertEqual(w.sandbox_records('vm'),[{'id':'one'},{'id':'two'}])
+        self.assertIn('--page-token',output.call_args.args[0])
+
+    def test_delete_already_absent_offers_only_host_cleanup(self):
+        self.session()
+        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'sandbox_records',return_value=[]),patch.object(w,'run') as run,patch('sys.stdout',new_callable=io.StringIO) as out:
+            w.delete_session('project-a1b2c3')
+        run.assert_not_called()
+        self.assertIn('already deleted',out.getvalue())
+        self.assertNotIn('waiting for cleanup',out.getvalue())
+
+    def test_cleanup_removes_completed_session_record_and_policy(self):
+        folder=self.session(); (folder/'policy.yaml').write_text('policy')
+        with patch('builtins.input') as prompt:
+            w.cleanup_host_artifacts(folder,self.host)
+        prompt.assert_not_called()
+        self.assertFalse(folder.exists())
+        self.assertTrue(self.host.exists())
+
+    def test_cleanup_keeps_unrecognized_session_files(self):
+        folder=self.session(); (folder/'unexpected').write_text('keep')
+        w.cleanup_host_artifacts(folder,self.host)
+        self.assertTrue((folder/'unexpected').exists())
+        self.assertTrue((folder/'session.json').exists())
+
+    def test_session_symlink_cannot_redirect_cleanup(self):
+        state=self.root/'state'; state.mkdir()
+        (state/'project-a1b2c3').symlink_to(self.host,target_is_directory=True)
+        with patch.object(w,'STATE',state):
+            with self.assertRaisesRegex(ValueError,'session directory'): w.meta('project-a1b2c3')
+        self.assertTrue(self.host.exists())
+
+    def test_delete_rejects_removed_discard_option(self):
+        with patch.object(w,'delete_session') as delete,patch('sys.stderr',new_callable=io.StringIO):
+            with self.assertRaises(SystemExit): w.main(['delete','--discard','test-a1b2c3'])
+        delete.assert_not_called()
+
     def test_defaults(self):
         with patch.object(w,'launch') as launch:
             w.main([]); a=launch.call_args.args[0]
@@ -125,7 +122,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_podman_project_mount_does_not_replace_reserved_workspace(self):
         from types import SimpleNamespace
-        with patch.object(w,'STATE',self.root/'state'), patch.object(w,'ROOT',self.root/'projects'), patch.object(w,'audit'), patch.object(w,'output',return_value=w.LABEL), patch.object(w,'provision_agents'), patch.object(w,'run') as run, patch.object(w.subprocess,'run',return_value=SimpleNamespace(returncode=0)) as invoke:
+        with patch.object(w,'STATE',self.root/'state'), patch.object(w,'ROOT',self.root/'projects'), patch.object(w,'audit'), patch.object(w,'output',return_value=w.LABEL), patch.object(w,'provision_agents'), patch.object(w,'delete_session'), patch.object(w,'run') as run, patch.object(w.subprocess,'run',return_value=SimpleNamespace(returncode=0)) as invoke:
             w.main(['podman','--project',str(self.host),'shell','-c','pwd'])
         create=next(c.args[0] for c in run.call_args_list if 'create' in c.args[0])
         config=json.loads(create[create.index('--driver-config-json')+1])
@@ -135,20 +132,21 @@ class WorkflowTests(unittest.TestCase):
 
     def test_vm_uses_live_project_without_snapshot_or_copyback(self):
         from types import SimpleNamespace
-        with patch.object(w,'STATE',self.root/'state'), patch.object(w,'ROOT',self.root/'projects'), patch.object(w,'audit') as audit, patch.object(w,'provision_agents'), patch.object(w,'vm_exit') as exit_vm, patch.object(w,'manifest',side_effect=AssertionError('no live hashing')), patch.object(w,'run') as run, patch.object(w.subprocess,'run',return_value=SimpleNamespace(returncode=0)):
+        with patch.object(w,'STATE',self.root/'state'), patch.object(w,'ROOT',self.root/'projects'), patch.object(w,'audit') as audit, patch.object(w,'provision_agents'), patch.object(w,'run') as run, patch.object(w.subprocess,'run',return_value=SimpleNamespace(returncode=0)):
             w.main(['--project',str(self.host),'shell','-c','pwd'])
         create=next(c.args[0] for c in run.call_args_list if 'create' in c.args[0])
         config=json.loads(create[create.index('--driver-config-json')+1])
         mounts=config['vm']['mounts']
-        self.assertEqual(len(mounts),1)
+        self.assertEqual(len(mounts),2)
+        self.assertEqual(mounts[1],{'type':'bind','source':str(w.TOOLS),'target':'/opt/host-tools','read_only':True})
         self.assertEqual(mounts[0]['source'],str(self.host))
         self.assertEqual(mounts[0]['target'],str(self.host))
         self.assertFalse(mounts[0]['read_only'])
         audit.assert_called_once_with(self.host,labels=False,include_dependencies=True,include_git=True)
-        exit_vm.assert_not_called()
+
         self.assertFalse(any('upload' in c.args[0] for c in run.call_args_list))
         record=next((self.root/'state').glob('*/session.json'))
-        self.assertEqual(json.loads(record.read_text())['project_mode'],'live')
+        self.assertEqual(json.loads(record.read_text())['workdir'],str(self.host))
 
     def test_live_vm_reentry_does_not_collect_or_prompt(self):
         from types import SimpleNamespace
@@ -156,18 +154,19 @@ class WorkflowTests(unittest.TestCase):
         record=folder/'session.json'; m=json.loads(record.read_text())
         m.update(project_mode='live',agent_setup=w.AGENT_SETUP_VERSION,workdir=str(Path('/workspace')/'project'))
         record.write_text(json.dumps(m))
-        with patch.object(w,'STATE',self.root/'state'), patch.object(w,'live_names',return_value={'test-a1b2c3'}), patch.object(w,'vm_exit') as exit_vm, patch.object(w.subprocess,'run',return_value=SimpleNamespace(returncode=0)):
+        with patch.object(w,'STATE',self.root/'state'), patch.object(w,'live_names',return_value={'test-a1b2c3'}), patch.object(w.subprocess,'run',return_value=SimpleNamespace(returncode=0)):
             w.enter('test-a1b2c3')
-        exit_vm.assert_not_called()
 
-    def test_live_vm_refuses_review_and_deletes_without_copyback(self):
+    def test_live_vm_delete_removes_local_record_without_copyback(self):
         folder=self.session(); record=folder/'session.json'
         m=json.loads(record.read_text()); m['project_mode']='live'; record.write_text(json.dumps(m))
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'run') as run:
-            with self.assertRaisesRegex(ValueError,'live'): w.collect('project-test')
-            with self.assertRaisesRegex(ValueError,'live'): w.review('project-test',True)
+        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'run') as run,patch.object(w,'sandbox_records',side_effect=[[{'id':'old','name':'project-a1b2c3'}],[]]):
             run.assert_not_called()
-            w.delete_session('project-test')
+            with patch('sys.stdout',new_callable=io.StringIO) as output:
+                w.delete_session('project-a1b2c3')
+            self.assertIn('Sandbox deleted; host project files remain.',output.getvalue())
+            self.assertFalse(folder.exists())
+            self.assertNotIn('backups retained',output.getvalue())
             run.assert_called_once()
 
     def test_project_policy_adds_only_the_selected_canonical_path(self):
@@ -198,6 +197,11 @@ class WorkflowTests(unittest.TestCase):
             w.main(['--project',str(self.host),'--image','localhost/override:test','--check'])
             self.assertEqual(run.call_args.args[0],['podman','image','exists','localhost/override:test'])
 
+    def test_claude_is_a_supported_agent(self):
+        with patch.object(w,'launch') as launch:
+            w.main(['claude'])
+            self.assertEqual(launch.call_args.args[0].agent,'claude')
+
     def test_candidate_image_cli(self):
         with patch.object(w,'launch') as launch:
             w.main(['--image','localhost/openshell-agent-dev:browser-test'])
@@ -218,16 +222,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('--',full_name)
         self.assertTrue(re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*',long_name))
 
-    def test_resolve_new_full_slug_or_short_id_and_legacy_prefix(self):
+    def test_resolve_full_slug_or_short_id(self):
         folder=self.add_named_session('icloud-md-a1b2c3')
-        self.add_named_session('project-abcdef1234')
         with patch.object(w,'STATE',self.root/'state'):
             self.assertEqual(w.meta('icloud-md-a1b2c3')[0],folder)
-            self.assertEqual(w.meta('project-abcdef1234')[0].name,'project-abcdef1234')
             self.assertEqual(w.resolve_session('icloud-md-a1b2c3'),'icloud-md-a1b2c3')
             self.assertEqual(w.resolve_session('icloud-md'),'icloud-md-a1b2c3')
             self.assertEqual(w.resolve_session('a1b2c3'),'icloud-md-a1b2c3')
-            self.assertEqual(w.resolve_session('abcdef'),'project-abcdef1234')
 
     def test_listing_continues_past_a_stopped_gateway(self):
         from types import SimpleNamespace
@@ -259,32 +260,6 @@ class WorkflowTests(unittest.TestCase):
         listed=type('R',(),{'returncode':0,'stdout':'icloud-md-a1b2c3\nproject-unrelated\nother-123abc\n'})()
         with patch.object(w,'STATE',self.root/'state'),patch.object(w.subprocess,'run',return_value=listed):
             self.assertEqual(w.live_names('vm'),{'icloud-md-a1b2c3'})
-    def test_legacy_alias_mapping(self):
-        self.assertEqual(w.cli('openshell','status')[2],'vm')
-        self.assertEqual(w.cli('podman-v012','status')[2],'podman')
-
-    def test_exit_yes_applies(self):
-        (self.source/'file').write_text('changed'); self.session()
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'collect'),patch('builtins.input',return_value='yes'),patch.object(w,'review') as review:
-            w.vm_exit('project-test'); review.assert_called_once_with('project-test',True)
-    def test_exit_no_needs_second_confirmation(self):
-        (self.source/'file').write_text('agent'); self.session()
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'collect'),patch('builtins.input',side_effect=['no','no']),patch.object(w,'run') as run:
-            w.vm_exit('project-test'); run.assert_not_called()
-        self.assertTrue((self.source/'file').exists())
-    def test_exit_discard_deletes_download(self):
-        (self.source/'file').write_text('agent'); folder=self.session()
-        download=folder/'download-test'; download.mkdir(); (download/'file').write_text('agent')
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'collect'),patch('builtins.input',side_effect=['no','discard']),patch.object(w,'run') as run:
-            w.vm_exit('project-test'); run.assert_called_once()
-        self.assertFalse(download.exists()); self.assertTrue(json.loads((folder/'session.json').read_text())['discarded'])
-    def test_exit_without_input_retains(self):
-        self.session()
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'collect'),patch('builtins.input',side_effect=EOFError),patch.object(w,'run') as run:
-            w.vm_exit('project-test'); run.assert_not_called()
-    def test_conflict_guidance(self):
-        (self.host/'file').write_text('before'); (self.source/'file').write_text('agent'); self.session(); (self.host/'file').write_text('host')
-        with self.assertRaisesRegex(ValueError,'diff -u --'): self.call_apply()
 
     def test_agent_bundle_excludes_host_auth(self):
         home=self.root/'home'; skills=home/'.agents/skills/user-docs'; skills.mkdir(parents=True); (skills/'SKILL.md').write_text('skill')
@@ -313,21 +288,16 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue((dest/'user-docs').is_symlink())
                 self.assertFalse((dest/'.system').is_symlink(), 'missing system skills must not leave a dangling link')
         with patch.object(w.Path,'home',return_value=home),patch.object(w,'STATE',self.root/'state'),patch.object(w,'run',side_effect=inspect):
-            w.provision_agents('project-test','vm')
+            w.provision_agents('project-a1b2c3','vm')
 
-    def test_reentry_refreshes_legacy_agent_setup_before_running_pi(self):
+    def test_reentry_refreshes_agent_setup_before_running_pi(self):
         for setup,expected_calls in [(True,1),(2,1),(w.AGENT_SETUP_VERSION,0)]:
             with self.subTest(setup=setup):
-                record={'gateway':'vm','runtime':'vm','agent_setup':setup,'host':str(self.host)}
+                record={'gateway':'vm','runtime':'vm','agent_setup':setup,'host':str(self.host),'project_mode':'live','workdir':str(self.host)}
                 result=type('R',(),{'returncode':0})()
-                with patch.object(w,'meta',return_value=(self.root,record)),patch.object(w,'live_names',return_value={'test'}),patch.object(w,'provision_agents') as provision,patch.object(w.subprocess,'run',return_value=result),patch.object(w,'vm_exit'):
+                with patch.object(w,'meta',return_value=(self.root,record)),patch.object(w,'live_names',return_value={'test'}),patch.object(w,'provision_agents') as provision,patch.object(w.subprocess,'run',return_value=result):
                     w.enter('test','pi')
                     self.assertEqual(provision.call_count,expected_calls)
-
-    def test_exit_unchanged_never_prompts_or_deletes(self):
-        self.session()
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'collect'),patch('builtins.input') as prompt,patch.object(w,'run') as run:
-            w.vm_exit('project-test'); prompt.assert_not_called(); run.assert_not_called()
 
     def test_https_origin_only(self):
         self.assertEqual(w.https_origin('HTTPS://Docs.Example.com/'),('https://docs.example.com','docs.example.com',443))
@@ -337,8 +307,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_allow_is_chromium_scoped_and_saved(self):
         folder=self.session()
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'live_names',return_value={'project-test'}),patch.object(w,'output',return_value='/opt/chromium/chrome'),patch.object(w,'run') as run:
-            w.allow_origin('project-test','https://docs.example.com')
+        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'live_names',return_value={'project-a1b2c3'}),patch.object(w,'output',return_value='/opt/chromium/chrome'),patch.object(w,'run') as run:
+            w.allow_origin('project-a1b2c3','https://docs.example.com')
         args=run.call_args.args[0]
         self.assertIn('--binary',args); self.assertEqual(args[args.index('--binary')+1],'/opt/chromium/chrome')
         self.assertIn('--add-endpoint',args); self.assertIn('docs.example.com:443:read-write:rest:enforce',args)
@@ -348,24 +318,24 @@ class WorkflowTests(unittest.TestCase):
 
     def test_allow_rejects_invalid_origin_before_policy(self):
         self.session()
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'live_names',return_value={'project-test'}),patch.object(w,'output',return_value='/opt/chromium/chrome'),patch.object(w,'run') as run:
+        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'live_names',return_value={'project-a1b2c3'}),patch.object(w,'output',return_value='/opt/chromium/chrome'),patch.object(w,'run') as run:
             for origin in ['http://docs.example.com','https://docs.example.com/private/path','https://127.0.0.1']:
-                with self.subTest(origin=origin),self.assertRaises(ValueError): w.allow_origin('project-test',origin)
+                with self.subTest(origin=origin),self.assertRaises(ValueError): w.allow_origin('project-a1b2c3',origin)
             run.assert_not_called()
 
     def test_revoke_only_removes_osh_managed_origin(self):
         folder=self.session(); record=json.loads((folder/'session.json').read_text()); record['browser_origins']={'https://docs.example.com':{'rule':'osh_browser_123','binary':'/opt/chromium/chrome'}}; (folder/'session.json').write_text(json.dumps(record))
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'live_names',return_value={'project-test'}),patch.object(w,'run') as run:
-            w.revoke_origin('project-test','https://docs.example.com/')
+        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'live_names',return_value={'project-a1b2c3'}),patch.object(w,'run') as run:
+            w.revoke_origin('project-a1b2c3','https://docs.example.com/')
             self.assertIn('--remove-rule',run.call_args.args[0]); self.assertIn('osh_browser_123',run.call_args.args[0])
-            with self.assertRaises(ValueError): w.revoke_origin('project-test','https://other.example.com')
+            with self.assertRaises(ValueError): w.revoke_origin('project-a1b2c3','https://other.example.com')
             self.assertEqual(run.call_count,1)
         self.assertEqual(json.loads((folder/'session.json').read_text())['browser_origins'],{})
 
     def test_forward_services_bind_host_loopback(self):
         self.session()
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'live_names',return_value={'project-test'}),patch.object(w,'run') as guest,patch.object(w.subprocess,'run',return_value=type('R',(),{'returncode':0})()) as forward:
-            w.forward_service('project-test',3000,13000)
+        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'live_names',return_value={'project-a1b2c3'}),patch.object(w,'run') as guest,patch.object(w.subprocess,'run',return_value=type('R',(),{'returncode':0})()) as forward:
+            w.forward_service('project-a1b2c3',3000,13000)
         guest.assert_not_called()
         args=forward.call_args.args[0]
         self.assertEqual(args[args.index('--local')+1],'127.0.0.1:13000')
@@ -373,8 +343,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_browser_view_starts_desktop_and_tunnels_localhost(self):
         self.session()
-        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'live_names',return_value={'project-test'}),patch.object(w,'run') as guest,patch.object(w.subprocess,'run',return_value=type('R',(),{'returncode':0})()) as forward:
-            w.browser_view('project-test')
+        with patch.object(w,'STATE',self.root/'state'),patch.object(w,'live_names',return_value={'project-a1b2c3'}),patch.object(w,'run') as guest,patch.object(w.subprocess,'run',return_value=type('R',(),{'returncode':0})()) as forward:
+            w.browser_view('project-a1b2c3')
         self.assertIn('agent-desktop',guest.call_args.args[0]); self.assertIn('start',guest.call_args.args[0])
         self.assertIn('127.0.0.1:6080',forward.call_args.args[0])
 

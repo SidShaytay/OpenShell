@@ -61,6 +61,45 @@ class WorkerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             w.sandbox_command(self.args+['--vm-mount', str(self.sibling)+'\tosfs1\trw'])
 
+    def test_tools_share_is_exact_and_read_only(self):
+        tools=self.base/'agent-tools'; tools.mkdir()
+        args=self.args+['--vm-mount',str(tools)+'\tosfs1\tro']
+        with patch.object(w,'TOOLS',tools):
+            command,fds=w.sandbox_command(args,['/usr/bin/true'])
+            for fd in fds: os.close(fd)
+            self.assertIn('--ro-bind-fd',command)
+            self.assertIn(str(tools),command)
+            for source,mode,tag in [(tools,'rw','osfs1'),(self.sibling,'ro','osfs1'),(tools,'ro','osfs2')]:
+                with self.subTest(source=source,mode=mode,tag=tag),self.assertRaises(ValueError):
+                    w.sandbox_command(self.args+['--vm-mount',f'{source}\t{tag}\t{mode}'])
+
+    def test_running_worker_sees_host_tools_updates_but_cannot_write(self):
+        tools=self.base/'agent-tools'; tools.mkdir(); (tools/'version').write_text('one')
+        args=self.args+['--vm-mount',str(tools)+'\tosfs1\tro']
+        code="""import pathlib,sys
+root=pathlib.Path(sys.argv[1])
+assert (root/'version').read_text()=='one'
+try: (root/'forbidden').write_text('write')
+except OSError: pass
+else: raise AssertionError('tools share was writable')
+print('ready',flush=True)
+sys.stdin.readline()
+assert (root/'version').read_text()=='two'
+print('updated',flush=True)
+"""
+        with patch.object(w,'TOOLS',tools):
+            command,fds=w.sandbox_command(args,['/usr/bin/python3','-c',code,str(tools)])
+        try:
+            process=subprocess.Popen(command,pass_fds=fds,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        finally:
+            for fd in fds: os.close(fd)
+        self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+        self.assertEqual(process.stdout.readline().strip(),'ready')
+        (tools/'next').write_text('two'); (tools/'next').replace(tools/'version')
+        stdout,stderr=process.communicate('continue\n',timeout=10)
+        self.assertEqual(process.returncode,0,stderr)
+        self.assertIn('updated',stdout)
+
     def test_disks_cannot_name_host_files_or_symlinks(self):
         (self.state/'escape').symlink_to(self.sibling/'canary')
         for outside in [self.sibling/'canary', self.state/'escape']:
@@ -100,7 +139,7 @@ class WorkerTests(unittest.TestCase):
         (confined/'provenance.json').write_text(json.dumps({'version':'0.1.7','driver_sha256':hashlib.sha256(b'fixture').hexdigest()}))
         config=home/'.config/openshell/servers/vm/gateway.toml'; config.parent.mkdir(parents=True)
         config.write_text('[openshell.drivers.vm]\ndriver_dir = '+json.dumps(str(confined))+'\nallow_driver_config = true\nenable_bind_mounts = true\n[openshell.drivers.vm.resource_admission]\nenabled = false\n')
-        unit=home/'.config/systemd/user/openshell-v0.1.2-vm.service'; unit.parent.mkdir(parents=True)
+        unit=home/'.config/systemd/user/openshell-vm.service'; unit.parent.mkdir(parents=True)
         unit.write_text('Environment="OPENSHELL_VM_HOST_LAUNCHER='+str(home)+'/.local/bin/openshell-vm-worker"\n')
         with patch.object(w,'HOME',home):
             w.check_install()

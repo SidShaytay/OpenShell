@@ -1,0 +1,12 @@
+[Unit]
+Description=Publish host-installed agents to the live VM tools share
+
+[Service]
+Type=simple
+Environment="PATH=/var/home/sid/.local/bin:/var/home/sid/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/usr/bin:/bin"
+ExecStart=/var/home/sid/.local/bin/openshell-agent-tools-watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

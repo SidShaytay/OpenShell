@@ -1,0 +1,102 @@
+#!/usr/bin/python3
+"""Publish installed agents after filesystem changes settle, with a six-hour fallback sync."""
+import ctypes
+import errno
+import os
+from pathlib import Path
+import select
+import struct
+import subprocess
+import time
+
+# Write completion, atomic replacements, removals and directory moves.
+MASK=0x8|0x40|0x80|0x100|0x200|0x400|0x800
+OVERFLOW=0x4000
+IGNORED=0x8000
+SYNC_INTERVAL=6*60*60
+HEADER=struct.Struct('iIII')
+
+
+class Watcher:
+    def __init__(self):
+        self.lib=ctypes.CDLL(None,use_errno=True)
+        self.lib.inotify_init1.argtypes=[ctypes.c_int]
+        self.lib.inotify_add_watch.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_uint32]
+        self.fd=self.lib.inotify_init1(os.O_NONBLOCK|os.O_CLOEXEC)
+        if self.fd<0: raise OSError(ctypes.get_errno(),'inotify_init1')
+        self.paths={}
+
+    def __enter__(self): return self
+    def __exit__(self,*args): os.close(self.fd)
+
+    def add(self,root,names):
+        root=Path(root)
+        if root.is_symlink() or not root.is_dir(): return
+        wd=self.lib.inotify_add_watch(self.fd,os.fsencode(root),MASK|0x2000000|0x1000000)
+        if wd<0:
+            error=ctypes.get_errno()
+            if error==errno.ENOENT: return
+            raise OSError(error,f'inotify watch {root}')
+        self.paths[wd]=(root,names)
+
+    def changed(self,timeout=None):
+        if not select.select([self.fd],[],[],timeout)[0]: return False
+        dirty=False
+        while True:
+            try: data=os.read(self.fd,1024*1024)
+            except BlockingIOError: break
+            offset=0
+            while offset<len(data):
+                wd,mask,_,length=HEADER.unpack_from(data,offset)
+                offset+=HEADER.size
+                name=os.fsdecode(data[offset:offset+length].split(b'\0',1)[0]); offset+=length
+                entry=self.paths.get(wd)
+                if mask&IGNORED:
+                    self.paths.pop(wd,None)
+                    raise RuntimeError('Watched directory removed; rebuilding watches')
+                if entry and name and entry[1] is not None and name not in entry[1]: continue
+                dirty=True
+                if mask&OVERFLOW:
+                    # Exiting causes systemd to rebuild all watches and sync.
+                    raise RuntimeError('inotify overflow; rebuilding watches')
+        return dirty
+
+
+def watch_plan():
+    home=Path.home()
+    return [
+        (home/'.local/bin',{'claude','codex'}),
+        (home/'.local/share/claude/versions',None),
+        (home/'.codex/packages/standalone',{'current'}),
+        (home/'.bun/bin',{'pi'}),
+        (home/'.bun/install/global',{'bun.lock','bun.lockb','package.json','node_modules'}),
+        (home/'.bun/install/global/node_modules/@earendil-works',{'pi-coding-agent','pi-agent-core','pi-ai','pi-codemode','pi-mcp','pi-tui'}),
+        (Path('/home/linuxbrew/.linuxbrew/bin'),{'node'}),
+        (Path('/home/linuxbrew/.linuxbrew/opt'),{'node'}),
+    ]
+
+
+def publish():
+    print('Syncing installed host tools (startup, installation event, or six-hour fallback).',flush=True)
+    result=subprocess.run([str(Path(__file__).resolve().with_name('openshell-agent-tools'))])
+    if result.returncode: raise RuntimeError('Publishing failed; service will retry after restart')
+
+
+def main():
+    with Watcher() as watch:
+        for root,names in watch_plan(): watch.add(root,names)
+        print(f'Watching {len(watch.paths)} non-recursive installation directories with filename filters; six-hour fallback sync.',flush=True)
+        publish()  # Watches are registered before startup sync.
+        next_sync=time.monotonic()+SYNC_INTERVAL
+        while True:
+            changed=watch.changed(max(0,next_sync-time.monotonic()))
+            if changed:
+                deadline=time.monotonic()+30
+                while time.monotonic()<deadline and watch.changed(2): pass
+            elif time.monotonic()<next_sync:
+                continue  # Only unrelated names were present in the event queue.
+            publish()
+            next_sync=time.monotonic()+SYNC_INTERVAL
+
+
+if __name__=='__main__': main()

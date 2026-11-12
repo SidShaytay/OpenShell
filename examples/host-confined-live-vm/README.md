@@ -16,7 +16,9 @@ This directory preserves the tested Vega implementation supporting
 - [`openshell-vm-reaper`](scripts/openshell-vm-reaper) preserves the vendor worker's
   parent-death checks inside the private PID namespace.
 - [`openshell-project`](scripts/openshell-project) is the `osh` client wrapper.
-  New sessions use live sharing; older snapshot sessions retain copy-back safeguards.
+  Projects are live-shared. Snapshot download/apply commands have been removed.
+  Deletion waits for gateway cleanup and removes the completed session record
+  and generated policy.
 - [`build-confined-driver`](scripts/build-confined-driver) verifies pinned 0.1.7
   inputs, reuses vendor runtime artifacts and builds the patched control-plane
   driver. The [resource manifest](runtime/v0.1.7-resources.json) records those inputs.
@@ -24,6 +26,42 @@ This directory preserves the tested Vega implementation supporting
 The source patch is already applied in this branch. The retained
 [`require-host-launcher.patch`](runtime/require-host-launcher.patch) is for the
 archive-based build recipe; do not apply it a second time to this worktree.
+
+## Live host agent tools
+
+New `osh` sessions mount `~/.local/share/openshell/agent-tools` read-only at
+`/opt/host-tools`. The project remains the separate read/write mount.
+`openshell-agent-tools` publishes the installed host Claude, Codex, Pi and Node
+versions, their required helper files, and Pi's dependency closure. It never
+copies host auth, settings, histories, or the host home directory.
+
+The enabled user service `openshell-agent-tools.service` uses eight non-recursive
+inotify watches: `~/.local/bin` (claude/codex), Claude's `versions` directory,
+Codex's `standalone` directory (current), `~/.bun/bin` (pi), Bun's global install
+root (lockfiles/package.json/node_modules), its `@earendil-works` scope (Pi
+packages only), and Homebrew's `bin` and `opt` directories (node only). It does
+not recursively watch dependencies or system libraries. Changes sync after two
+quiet seconds. A fallback sync runs after six hours without a completed sync to
+catch in-place dependency updates the small watch set misses. It also syncs at
+startup. Run `osh tools` for immediate manual sync. Enable the service with
+`systemctl --user enable --now openshell-agent-tools.service` (already enabled).
+Each new tool
+invocation in an already-running tools-enabled VM resolves its current release.
+Existing processes keep their files; no VM restart or image rebuild is needed
+for subsequent tool updates. VMs predating the tools mount need to be recreated
+once to acquire the share.
+
+Publishing uses atomic per-tool pointers and validates candidate versions before
+switching. Old releases remain available for running processes and are not
+removed automatically. Node includes its host shared libraries. The publisher
+uses host `patchelf` (installed with `uv tool install patchelf==0.19.3.0`) to
+relocate copied Node and Claude binaries; host executables are unchanged.
+Guest authentication and state remain guest-local. The host watcher publishes
+installed updates; it does not download newer agent versions itself.
+
+The worker accepts only the selected project as `osfs0` and the exact read-only
+tools directory as `osfs1`. Existing network endpoint grants stay unchanged;
+network policy admits the corresponding host-published executable paths.
 
 ## Run the preserved tests
 
@@ -34,9 +72,9 @@ uv run --no-project --python /usr/bin/python3 python -B -m unittest discover \
   -s examples/host-confined-live-vm/tests -p 'test_*.py'
 ```
 
-All 55 tests passed after import. Tests include direct host-process canary checks,
+The tests include direct host-process canary checks,
 symlink/ancestor/proc/descriptor escape attempts, deployment-provenance checks and
-legacy snapshot regressions. They are not guest-kernel exploit tests or a formal
+live sharing and session cleanup regressions. They are not guest-kernel exploit tests or a formal
 security proof. The imported driver file is byte-identical to the source used by
 the deployed 0.1.7 build; this import did not rebuild or redeploy the runtime.
 
